@@ -1,0 +1,677 @@
+#!/usr/bin/env bash
+# nix-devshell-cached-exports: print the environment a project's Nix devshell
+# adds, as `export` statements, from a cache keyed on the files that define
+# the devshell. Callers run:
+#
+#   eval "$(nix-devshell-cached-exports)"
+#
+# The devshell is entered once per change to those files (running its shell
+# hooks there); every other call is root detection, a hash and a `cat`.
+#
+# This script needs bash >= 4.4 and GNU coreutils, git, flock (util-linux).
+# Its OUTPUT is plain POSIX sh that also sources in bash 3.2 and zsh.
+set -euo pipefail
+unset CDPATH
+
+readonly PROG=nix-devshell-cached-exports
+readonly FORMAT_VERSION=ndce-v1
+readonly IDENT_CHARS=ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_
+readonly LOCK_TIMEOUT=900
+readonly FAILED_TAIL_LINES=50
+
+# The packaged command (package.nix) sets __NDCE_TOOLS_PATH to its pinned
+# tools. They go in front of PATH for this script only; the devshell capture
+# starts from the caller's own PATH, so the tools never leak into the output.
+caller_path=${PATH-}
+if [[ -n ${__NDCE_TOOLS_PATH-} ]]; then
+  PATH=$__NDCE_TOOLS_PATH${PATH:+:$PATH}
+fi
+
+usage() {
+  cat <<EOF
+Usage: $PROG [export] [--dir PATH] [--refresh] [--format bash]
+       $PROG --print-key [--dir PATH]
+       $PROG --print-cache-path [--dir PATH]
+       $PROG -h | --help
+
+Print the environment the project's Nix devshell adds, as export statements,
+from a cache keyed on the files that define the devshell:
+
+  eval "\$($PROG)"
+
+  export              print the exports (the default)
+  --dir PATH          act as if called from PATH (default: the current directory)
+  --refresh           ignore the cache entry and failure marker; capture again
+  --format bash       output format (only bash, which zsh also sources)
+  --print-key         print the cache key and exit
+  --print-cache-path  print the path of the cache entry for the current key
+  -h, --help          show this help
+
+Outside a Nix project it prints nothing and exits 0.
+EOF
+}
+
+usage_error() {
+  printf '%s: %s\n' "$PROG" "$1" >&2
+  usage >&2
+  exit 2
+}
+
+die() {
+  printf '%s: %s\n' "$PROG" "$1" >&2
+  exit 1
+}
+
+# ---------------------------------------------------------------------------
+# Arguments
+
+mode=
+dir=.
+dir_given=0
+refresh=0
+
+set_mode() {
+  if [[ -n $mode && $mode != "$1" ]]; then
+    usage_error "conflicting modes: $mode and $1"
+  fi
+  mode=$1
+}
+
+set_format() {
+  case $1 in
+  bash) ;;
+  fish | json)
+    printf '%s: --format %s is not supported yet\n' "$PROG" "$1" >&2
+    exit 2
+    ;;
+  *) usage_error "unknown format: $1" ;;
+  esac
+}
+
+while (($#)); do
+  case $1 in
+  export) set_mode export ;;
+  --dir)
+    (($# >= 2)) || usage_error "--dir needs a path"
+    dir=$2 dir_given=1
+    shift
+    ;;
+  --dir=*) dir=${1#--dir=} dir_given=1 ;;
+  --refresh) refresh=1 ;;
+  --format)
+    (($# >= 2)) || usage_error "--format needs a value"
+    set_format "$2"
+    shift
+    ;;
+  --format=*) set_format "${1#--format=}" ;;
+  --print-key) set_mode print-key ;;
+  --print-cache-path) set_mode print-cache-path ;;
+  -h | --help)
+    usage
+    exit 0
+    ;;
+  *) usage_error "unknown argument: $1" ;;
+  esac
+  shift
+done
+mode=${mode:-export}
+
+if [[ -z $dir ]]; then
+  usage_error "--dir needs a path"
+fi
+if ! cd -P -- "$dir" 2>/dev/null; then
+  # An unusable explicit --dir is a usage error; an unusable current
+  # directory (deleted, no permission) is simply not a project.
+  ((dir_given)) && usage_error "not a directory: $dir"
+  exit 0
+fi
+dir=$PWD
+
+# ---------------------------------------------------------------------------
+# Root and kind
+
+has_entry_file() {
+  [[ -f $1/flake.nix || -f $1/shell.nix || -f $1/default.nix ]]
+}
+
+git_top=$(git -C "$dir" rev-parse --show-toplevel 2>/dev/null) || git_top=
+root=
+if [[ -n $git_top ]] && has_entry_file "$git_top"; then
+  root=$git_top
+else
+  d=$dir
+  while :; do
+    if has_entry_file "$d"; then
+      root=${d:-/}
+      break
+    fi
+    [[ -n $d && $d != / ]] || break
+    d=${d%/*}
+  done
+fi
+[[ -n $root ]] || exit 0 # outside any project
+
+in_git=0
+if [[ -n $git_top ]] && [[ $root == "$git_top" || $root == "$git_top"/* ]]; then
+  in_git=1
+fi
+
+if [[ -f $root/flake.nix ]]; then
+  kind=flake
+  entry_file=$root/flake.nix
+elif [[ -f $root/shell.nix ]]; then
+  kind=shell
+  entry_file=$root/shell.nix
+else
+  kind=shell
+  entry_file=$root/default.nix
+fi
+
+cd -- "$root"
+
+# ---------------------------------------------------------------------------
+# Key
+
+# Sets `files` to the sorted, de-duplicated list of files (relative to the
+# root, which is the current directory) whose contents make up the key.
+list_files() {
+  local -a raw=()
+  local f prev='' status=0
+  if ((in_git)); then
+    mapfile -d '' raw < <(git ls-files -z -- flake.nix flake.lock '*.nix' '*/flake.lock')
+    wait "$!" || status=$?
+    ((status == 0)) || die "git ls-files failed in $root"
+  else
+    mapfile -d '' raw < <(
+      find . \( -name .git -o -name 'result*' -o -name node_modules \) -prune \
+        -o \( -type f -o -type l \) \( -name '*.nix' -o -name flake.lock \) -print0 \
+        2>/dev/null | LC_ALL=C sort -z
+    )
+  fi
+  files=()
+  for f in "${raw[@]}"; do
+    f=${f#./}
+    # git lists an unmerged path once per stage; sorted, so duplicates are
+    # adjacent. Index entries missing from the work tree are skipped.
+    [[ $f != "$prev" ]] || continue
+    prev=$f
+    [[ -f $f ]] && files+=("$f")
+  done
+  return 0
+}
+
+# hash_files NAME... : sets `hash` to the first 32 hex chars of the sha256 of
+# the format-version line, the kind line, the NUL-terminated names, then each
+# file's own sha256 in that order (so bytes cannot move across a file boundary
+# unnoticed); and `root_hash` to the sha256 of the root's path (the same
+# sha256sum process hashes both).
+hash_files() {
+  local sums
+  sums=$(
+    {
+      printf '%s\n%s\n' "$FORMAT_VERSION" "$kind"
+      if (($#)); then
+        printf '%s\0' "$@"
+        sha256sum -- "$@"
+      fi
+    } | sha256sum - /dev/fd/3 3< <(printf '%s' "$root")
+  ) || die "cannot read the files that define the devshell in $root"
+  hash=${sums:0:32}
+  root_hash=${sums#*$'\n'}
+  root_hash=${root_hash%% *}
+}
+
+# Sets `key`, `root_hash`, and `cache_file` once `cache_dir` is known.
+compute_key() {
+  list_files
+  hash_files ${files[@]+"${files[@]}"}
+  key=$hash
+  cache_file=${cache_dir:+$cache_dir/$key.sh}
+}
+
+cache_dir=
+compute_key
+
+if [[ $mode == print-key ]]; then
+  printf '%s\n' "$key"
+  exit 0
+fi
+
+# ---------------------------------------------------------------------------
+# Cache location
+
+if [[ ${XDG_CACHE_HOME-} == /* ]]; then
+  cache_base=$XDG_CACHE_HOME
+elif [[ -n ${HOME-} ]]; then
+  cache_base=$HOME/.cache
+else
+  die "cannot locate the cache: neither XDG_CACHE_HOME nor HOME is set"
+fi
+cache_dir=$cache_base/$PROG/${root_hash:0:16}
+cache_file=$cache_dir/$key.sh
+
+if [[ $mode == print-cache-path ]]; then
+  printf '%s\n' "$cache_file"
+  exit 0
+fi
+
+# ---------------------------------------------------------------------------
+# Fast path: a cache hit is a `cat` (done with builtins: no process to start).
+
+# print_hit : prints the cache entry for the current key and exits 0, if it
+# exists and is non-empty; returns 1 otherwise.
+print_hit() {
+  local text=''
+  [[ -s $cache_file ]] || return 1
+  IFS= read -r -d '' text <"$cache_file" || [[ -n $text ]] || return 1
+  printf '%s' "$text"
+  exit 0
+}
+
+if ((! refresh)); then
+  print_hit || true
+fi
+
+# ---------------------------------------------------------------------------
+# Failure handling
+
+tmp_files=()
+cleanup() {
+  if ((${#tmp_files[@]})); then
+    rm -f -- "${tmp_files[@]}"
+  fi
+}
+trap cleanup EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+new_tmp() { # new_tmp NAME: creates a temp file in the cache dir, sets `tmp`
+  tmp=$(mktemp "$cache_dir/.$1.XXXXXX") || die "cannot create a file in $cache_dir"
+  tmp_files+=("$tmp")
+}
+
+# fail DETAILS_FILE | fail -m MESSAGE | fail -r MESSAGE : print the last good
+# environment with one warning line and exit 0; without one, print the details
+# on stderr (or, with -r, one line ending in MESSAGE) and exit 1 with nothing
+# on stdout.
+fail() {
+  local last_good=$cache_dir/last-good
+  if [[ -s $last_good ]] && cat -- "$last_good"; then
+    printf '%s: devshell capture failed for %s; using the last good environment. Fix it, then run: %s --refresh\n' \
+      "$PROG" "$root" "$PROG" >&2
+    exit 0
+  fi
+  if [[ $1 == -r ]]; then
+    printf '%s: devshell capture failed for %s; %s\n' "$PROG" "$root" "$2" >&2
+    exit 1
+  fi
+  printf '%s: devshell capture failed for %s:\n' "$PROG" "$root" >&2
+  if [[ $1 == -m ]]; then
+    printf '%s\n' "$2" >&2
+  else
+    cat -- "$1" >&2 || true
+  fi
+  exit 1
+}
+
+# fail_remembered : a capture of this key already failed; say so in one line
+# rather than repeating the details on every call.
+fail_remembered() {
+  fail -r "details in $cache_dir/$key.failed; fix it, then run: $PROG --refresh"
+}
+
+if ((! refresh)) && [[ -e $cache_dir/$key.failed ]]; then
+  fail_remembered
+fi
+
+# ---------------------------------------------------------------------------
+# Lock, then re-check: another caller may have captured while we waited.
+
+mkdir -p -- "$cache_dir" || die "cannot create $cache_dir"
+exec {lock_fd}>>"$cache_dir/.lock" || die "cannot open $cache_dir/.lock"
+if ! flock -w "$LOCK_TIMEOUT" "$lock_fd"; then
+  fail -m "timed out after ${LOCK_TIMEOUT}s waiting for another capture of $root"
+fi
+
+compute_key # the files may have changed while we waited
+if ((! refresh)); then
+  print_hit || true
+  if [[ -e $cache_dir/$key.failed ]]; then
+    fail_remembered
+  fi
+fi
+
+# ---------------------------------------------------------------------------
+# Capture
+
+# matches_any NAME PATTERN... : a pattern ending in `*` is a prefix.
+matches_any() {
+  local name=$1 p
+  shift
+  for p; do
+    if [[ $p == *'*' ]]; then
+      [[ $name == "${p%'*'}"* ]] && return 0
+    else
+      [[ $name == "$p" ]] && return 0
+    fi
+  done
+  return 1
+}
+
+is_ident() {
+  [[ -n $1 && $1 != [0123456789]* && $1 != *[!$IDENT_CHARS]* ]]
+}
+
+# words VAR DEFAULT... : sets `list` to the words of $VAR if VAR is set,
+# else to DEFAULT.
+words() {
+  local var=$1
+  shift
+  if [[ -n ${!var+set} ]]; then
+    list=()
+    read -r -d '' -a list <<<"${!var}" || true
+  else
+    list=("$@")
+  fi
+}
+
+words NDCE_PASSTHROUGH HOME USER LOGNAME PATH TERM LANG 'LC_*' TZ NIX_PATH \
+  NIX_CONFIG NIX_USER_CONF_FILES NIX_SSL_CERT_FILE SSL_CERT_FILE NIX_REMOTE \
+  SSH_AUTH_SOCK GIT_SSH GIT_SSH_COMMAND 'XDG_*' TMPDIR
+passthrough=("${list[@]}")
+words NDCE_EXCLUDE TMPDIR TMP TEMP TEMPDIR NIX_BUILD_TOP SHLVL PWD OLDPWD _ \
+  __CF_USER_TEXT_ENCODING 'BASH_*' BASHOPTS SHELLOPTS
+exclude=("${list[@]}")
+words NDCE_PREPEND_VARS PATH XDG_DATA_DIRS
+prepend_vars=()
+for v in "${list[@]}"; do
+  is_ident "$v" && prepend_vars+=("$v")
+done
+
+# strip_entries VALUE LIST : sets `stripped` to the colon list VALUE without
+# the entries of the colon list LIST. Empty entries in VALUE are kept.
+strip_entries() {
+  local rest=$1: remove=":$2:" out='' e
+  if [[ -z $1 ]]; then
+    stripped=
+    return 0
+  fi
+  while [[ -n $rest ]]; do
+    e=${rest%%:*}
+    rest=${rest#*:}
+    if [[ -n $e && $remove == *":$e:"* ]]; then
+      continue
+    fi
+    out+=":$e"
+  done
+  stripped=${out#:}
+}
+
+# The deterministic baseline: the pass-through variables only, with what a
+# previous load prepended (recorded in __NDCE_ADDED_<VAR>) taken back out.
+# (`env -0`, not `compgen -e`: the packaged script runs under a bash built
+# without programmable completion.)
+base_args=()
+mapfile -d '' exported < <(env -0)
+wait "$!" || die "env -0 failed"
+for kv in "${exported[@]}"; do
+  name=${kv%%=*}
+  is_ident "$name" || continue
+  matches_any "$name" ${passthrough[@]+"${passthrough[@]}"} || continue
+  if [[ $name == PATH ]]; then
+    value=$caller_path
+  else
+    value=${kv#*=}
+  fi
+  if matches_any "$name" ${prepend_vars[@]+"${prepend_vars[@]}"}; then
+    added_var=__NDCE_ADDED_$name
+    if [[ -n ${!added_var-} ]]; then
+      strip_entries "$value" "${!added_var}"
+      value=$stripped
+      [[ -n $value ]] || continue
+    fi
+  fi
+  base_args+=("$name=$value")
+done
+
+case $kind in
+flake) entry_cmd=nix ;;
+shell) entry_cmd=nix-shell ;;
+esac
+base_path=$caller_path
+for kv in ${base_args[@]+"${base_args[@]}"}; do
+  [[ $kv == PATH=* ]] && base_path=${kv#PATH=}
+done
+entry_bin=$(PATH=$base_path type -P "$entry_cmd") ||
+  entry_bin=$(type -P "$entry_cmd") ||
+  fail -m "$entry_cmd not found on PATH"
+env_bin=$(type -P env) || fail -m "env not found on PATH"
+
+new_tmp baseline
+baseline_file=$tmp
+new_tmp stdout
+out_file=$tmp
+new_tmp stderr
+err_file=$tmp
+
+env -i -- ${base_args[@]+"${base_args[@]}"} "$env_bin" -0 >"$baseline_file" {lock_fd}>&- ||
+  fail -m "could not record the baseline environment"
+
+# The entry prints a NUL-terminated sentinel before `env -0`, so anything a
+# shell hook prints to stdout lands in front of it and is discarded. The
+# flake entry runs this bash (a store path in the package) rather than
+# relying on a shell being on the devshell's PATH; nix-shell --run is bash.
+SENTINEL=__NDCE_ENV_BEGIN__
+entry_script="printf '%s\\0' $SENTINEL; exec env -0"
+if [[ $kind == flake ]]; then
+  entry=("$entry_bin" develop "$root" --command "$BASH" -c "$entry_script")
+else
+  entry=("$entry_bin" "$entry_file" --run "$entry_script")
+fi
+
+# parse_env0 FILE ARRAY [SENTINEL] : reads `env -0` output into the
+# associative ARRAY. With SENTINEL, records up to and including the one that
+# ends with it are skipped (a shell hook's own output); if it never appears,
+# ARRAY stays empty.
+# shellcheck disable=SC2034 # `into` is a nameref to the caller's array
+parse_env0() {
+  local -n into=$2
+  local kv skipping=0
+  [[ -n ${3-} ]] && skipping=1
+  while IFS= read -r -d '' kv || [[ -n $kv ]]; do
+    if ((skipping)); then
+      [[ $kv == *"$3" ]] && skipping=0
+      continue
+    fi
+    [[ $kv == *=* ]] || continue
+    is_ident "${kv%%=*}" || continue
+    into[${kv%%=*}]=${kv#*=}
+  done <"$1"
+}
+
+declare -A base_env=() dev_env=()
+
+# non_lock_hash : hashes the current `files` without any flake.lock.
+non_lock_hash() {
+  local f
+  local -a non_lock=()
+  for f in ${files[@]+"${files[@]}"}; do
+    [[ $f == flake.lock || $f == */flake.lock ]] || non_lock+=("$f")
+  done
+  hash_files ${non_lock[@]+"${non_lock[@]}"}
+}
+non_lock_hash
+pre_sig=$hash
+pre_key=$key
+
+capture_status=0
+# The lock fd is closed for the capture: anything the shell hook leaves
+# running in the background would otherwise hold the lock after we exit.
+env -i -- ${base_args[@]+"${base_args[@]}"} "${entry[@]}" \
+  </dev/null >"$out_file" 2>"$err_file" {lock_fd}>&- || capture_status=$?
+
+record_failure() { # record_failure DETAILS_FILE
+  local marker=$cache_dir/$key.failed
+  new_tmp failed
+  tail -n "$FAILED_TAIL_LINES" -- "$1" >"$tmp" || true
+  mv -f -- "$tmp" "$marker"
+  fail "$marker"
+}
+
+if ((capture_status != 0)); then
+  if [[ ! -s $err_file ]]; then
+    printf '%s exited with status %d\n' "${entry[*]}" "$capture_status" >"$err_file"
+  fi
+  record_failure "$err_file"
+fi
+
+parse_env0 "$baseline_file" base_env
+parse_env0 "$out_file" dev_env "$SENTINEL"
+
+if ((${#dev_env[@]} == 0)); then
+  printf '%s printed no environment\n' "${entry[*]}" >>"$err_file"
+  record_failure "$err_file"
+fi
+
+# ---------------------------------------------------------------------------
+# Diff -> output
+
+# quote VALUE : sets `quoted` to VALUE in single quotes (valid in any POSIX
+# shell, bash 3.2 and zsh; newlines and control characters stay literal).
+quote() {
+  local sq="'\\''"
+  quoted="'${1//\'/"$sq"}'"
+}
+
+is_excluded() {
+  matches_any "$1" ${exclude[@]+"${exclude[@]}"} && return 0
+  if [[ $1 == SHELL ]]; then
+    [[ $2 == /sbin/nologin || $2 == /usr/bin/false ]] && return 0
+  fi
+  return 1
+}
+
+# Output code for one prepend variable (@VAR@, with @ADDED@ its quoted added
+# list). It must run in bash 3.2, zsh and POSIX sh, under set -eu: it puts the
+# added entries first and drops them, and whatever an earlier load recorded in
+# __NDCE_ADDED_@VAR@, from the caller's value, keeping its empty entries. The
+# caller's value is split in one step (zsh's (s.:.) flag, else IFS=: with
+# globbing off), since a per-entry ${v%%:*} loop is quadratic.
+# shellcheck disable=SC2016 # single quotes intended: this is output code
+PREPEND_TEMPLATE='__ndce_a=@ADDED@
+__ndce_o=${__NDCE_ADDED_@VAR@-}
+__ndce_v=${@VAR@-}
+__ndce_r=
+if [ "$__ndce_o" = "$__ndce_a" ]; then __ndce_o=; fi
+if [ -n "$__ndce_v" ]; then
+  if [ -n "${ZSH_VERSION-}" ]; then
+    eval '"'"'for __ndce_e in "${(@s.:.)__ndce_v}"; do
+      case $__ndce_e in "") __ndce_r="${__ndce_r}:" ;; *) case ":${__ndce_a}:${__ndce_o}:" in *":${__ndce_e}:"*) ;; *) __ndce_r="${__ndce_r}:${__ndce_e}" ;; esac ;; esac
+    done'"'"'
+  else
+    __ndce_g=
+    case $- in *f*) ;; *) __ndce_g=1; set -f ;; esac
+    if [ -n "${IFS+x}" ]; then __ndce_i=$IFS; __ndce_u=; else __ndce_i=; __ndce_u=1; fi
+    IFS=:
+    __ndce_v="${__ndce_v}:"
+    for __ndce_e in $__ndce_v; do
+      case $__ndce_e in "") __ndce_r="${__ndce_r}:" ;; *) case ":${__ndce_a}:${__ndce_o}:" in *":${__ndce_e}:"*) ;; *) __ndce_r="${__ndce_r}:${__ndce_e}" ;; esac ;; esac
+    done
+    if [ -n "$__ndce_u" ]; then unset IFS; else IFS=$__ndce_i; fi
+    if [ -n "$__ndce_g" ]; then set +f; fi
+  fi
+fi
+export @VAR@="${__ndce_a}${__ndce_r}"
+export __NDCE_ADDED_@VAR@="${__ndce_a}"
+'
+
+# Everything below goes after the header, filled in once the key is final.
+body=
+prepend_body=
+mapfile -t names < <(printf '%s\n' "${!dev_env[@]}" | LC_ALL=C sort)
+for name in "${names[@]}"; do
+  value=${dev_env[$name]}
+  is_excluded "$name" "$value" && continue
+  if [[ -n ${base_env[$name]+set} && ${base_env[$name]} == "$value" ]]; then
+    continue
+  fi
+
+  if matches_any "$name" ${prepend_vars[@]+"${prepend_vars[@]}"}; then
+    base_value=${base_env[$name]-}
+    added=
+    replaced=0
+    if [[ -z $base_value ]]; then
+      added=$value
+    elif [[ $value == *":$base_value" ]]; then
+      added=${value%":$base_value"}
+    else
+      replaced=1
+    fi
+    if ((! replaced)); then
+      # Drop empty and repeated entries from the added list.
+      declare -A seen=()
+      clean=
+      rest=$added:
+      while [[ -n $rest ]]; do
+        e=${rest%%:*}
+        rest=${rest#*:}
+        [[ -n $e && -z ${seen[$e]+set} ]] || continue
+        # The caller's own entries, repeated by the devshell, are not added.
+        [[ ":$base_value:" == *":$e:"* ]] && continue
+        seen[$e]=1
+        clean+=":$e"
+      done
+      unset seen
+      clean=${clean#:}
+      [[ -n $clean ]] || continue
+      quote "$clean"
+      block=${PREPEND_TEMPLATE//@VAR@/$name}
+      prepend_body+=${block//@ADDED@/"$quoted"}
+      continue
+    fi
+    # Replaced rather than prepended: an absolute value like any other.
+    quote "$value"
+    body+="export $name=$quoted
+unset __NDCE_ADDED_$name
+"
+    continue
+  fi
+
+  quote "$value"
+  body+="export $name=$quoted
+"
+done
+if [[ -n $prepend_body ]]; then
+  prepend_body+="unset __ndce_a __ndce_o __ndce_v __ndce_e __ndce_r __ndce_g __ndce_i __ndce_u
+"
+fi
+
+# ---------------------------------------------------------------------------
+# Store under the post-capture key: a first `nix develop` may create or
+# rewrite flake.lock. If anything other than a flake.lock changed while the
+# capture ran, the capture may predate that edit, so it is stored under the
+# key it started from instead and the next call captures again.
+
+compute_key
+non_lock_hash
+if [[ $hash != "$pre_sig" ]]; then
+  key=$pre_key
+  cache_file=$cache_dir/$key.sh
+fi
+
+header_root=${root//$'\n'/\\n}
+output="# $PROG v1 root=$header_root key=$key
+$body$prepend_body"
+
+new_tmp "$key"
+printf '%s' "$output" >"$tmp"
+mv -f -- "$tmp" "$cache_file"
+
+# Repoint last-good atomically (rename over the old link).
+new_tmp last-good
+ln -sf -- "$key.sh" "$tmp"
+mv -f -- "$tmp" "$cache_dir/last-good"
+rm -f -- "$cache_dir/$key.failed" "$cache_dir/$pre_key.failed"
+
+printf '%s' "$output"
