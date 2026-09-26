@@ -240,6 +240,12 @@ Checked against Claude Code 2.1.282 on 2026-09-26, from a headless run with
      the marker had two lines: one capture per change, none per command.
   3. A subagent started with the Agent tool ran `echo $NDCE_X $PROBE_PWD`
      and printed `2` and the project root: subagents load the same file.
+- The same run, repeated on 2026-09-27 against the published repository —
+  the package from `nix build github:nhooey/nix-devshell-cached-exports`
+  on `PATH`, and the plugin installed with
+  `claude plugin marketplace add nhooey/nix-devshell-cached-exports` and
+  `claude plugin install nix-devshell-cached-exports@nix-devshell-cached-exports`
+  instead of `--plugin-dir` — gave the same three results.
 - With no such command on `PATH`, the same kind of session still completed
   normally (exit 0); the hook itself, exercised directly, printed exactly
   one line to stderr and left `$CLAUDE_ENV_FILE` untouched, matching
