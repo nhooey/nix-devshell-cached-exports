@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+# Test stub for `nix`, standing in for real nix in the bats sandbox
+# (tests/unit.bats). Supports exactly one invocation shape, the one
+# nix-devshell-cached-exports uses to capture a flake devshell:
+#
+#   nix develop <root> --command <program> [<arg>...]
+#
+# See CONTRACT.md, "Test stubs", for the required behaviour.
+set -euo pipefail
+
+usage_error() {
+  echo "stub-nix: unsupported invocation: $*" >&2
+  exit 64
+}
+
+[ "$#" -ge 4 ] || usage_error "$@"
+[ "$1" = "develop" ] || usage_error "$@"
+root=$2
+[ "$3" = "--command" ] || usage_error "$@"
+
+if [ -n "${STUB_NIX_LOG:-}" ]; then
+  printf 'nix %s\n' "$*" >>"$STUB_NIX_LOG"
+fi
+
+if [ -n "${STUB_NIX_SLEEP:-}" ]; then
+  sleep "$STUB_NIX_SLEEP"
+fi
+
+if [ -e "$root/BROKEN" ]; then
+  echo "stub-nix: simulated devshell failure for $root" >&2
+  exit 1
+fi
+
+(
+  cd "$root"
+  # shellcheck source=/dev/null
+  source "$root/stub-env.sh"
+  exec "${@:4}"
+)

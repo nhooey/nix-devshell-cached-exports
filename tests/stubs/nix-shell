@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+# Test stub for `nix-shell`, standing in for real nix in the bats sandbox
+# (tests/unit.bats). Supports exactly one invocation shape, the one
+# nix-devshell-cached-exports uses to capture a shell.nix/default.nix
+# devshell:
+#
+#   nix-shell <file> --run <script>
+#
+# See CONTRACT.md, "Test stubs", for the required behaviour.
+set -euo pipefail
+
+usage_error() {
+  echo "stub-nix-shell: unsupported invocation: $*" >&2
+  exit 64
+}
+
+[ "$#" -eq 3 ] || usage_error "$@"
+file=$1
+[ "$2" = "--run" ] || usage_error "$@"
+
+root=$(dirname -- "$file")
+
+if [ -n "${STUB_NIX_LOG:-}" ]; then
+  printf 'nix-shell %s\n' "$*" >>"$STUB_NIX_LOG"
+fi
+
+if [ -n "${STUB_NIX_SLEEP:-}" ]; then
+  sleep "$STUB_NIX_SLEEP"
+fi
+
+if [ -e "$root/BROKEN" ]; then
+  echo "stub-nix-shell: simulated devshell failure for $root" >&2
+  exit 1
+fi
+
+(
+  cd "$root"
+  # shellcheck source=/dev/null
+  source "$root/stub-env.sh"
+  exec bash -c "$3"
+)
