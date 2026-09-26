@@ -1,0 +1,12 @@
+{
+  "name": "nix-devshell-cached-exports",
+  "description": "Load a Nix devshell's cached exports into every Bash command via SessionStart",
+  "version": "0.1.0",
+  "author": {
+    "name": "Neil Hooey"
+  },
+  "homepage": "https://github.com/nhooey/nix-devshell-cached-exports",
+  "repository": "https://github.com/nhooey/nix-devshell-cached-exports",
+  "license": "MIT",
+  "keywords": ["nix", "devshell", "direnv", "environment"]
+}

@@ -1,0 +1,14 @@
+{
+  "name": "nix-devshell-cached-exports",
+  "description": "Marketplace for the nix-devshell-cached-exports plugin",
+  "owner": {
+    "name": "Neil Hooey"
+  },
+  "plugins": [
+    {
+      "name": "nix-devshell-cached-exports",
+      "source": "./",
+      "description": "Load a Nix devshell's cached exports into every Bash command via SessionStart"
+    }
+  ]
+}
