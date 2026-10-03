@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+# Sets the Claude Code plugin's version in .claude-plugin/plugin.json and in
+# its .claude-plugin/marketplace.json entry.
+#
+# Claude Code fetches an installed plugin again only when this version
+# changes: `/plugin update` reports "already at the latest version" and
+# `/reload-plugins` reloads the cached copy. So any change to the plugin's
+# files (hooks/) needs a bump, or it never reaches anyone who installed it.
+# tests/hooks.bats fails until there is one.
+#
+# Usage: bump-plugin-version [major | minor | patch | X.Y.Z]   (default: minor)
+set -euo pipefail
+
+root=$(cd "$(dirname "$0")/.." && pwd)
+plugin=$root/.claude-plugin/plugin.json
+marketplace=$root/.claude-plugin/marketplace.json
+
+old=$(grep -oE '"version": *"[0-9]+\.[0-9]+\.[0-9]+"' "$plugin" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')
+IFS=. read -r major minor patch <<<"$old"
+
+arg=${1:-minor}
+case $arg in
+major) new=$((major + 1)).0.0 ;;
+minor) new=$major.$((minor + 1)).0 ;;
+patch) new=$major.$minor.$((patch + 1)) ;;
+*) new=$arg ;;
+esac
+if [[ ! $new =~ ^[0-9]+\.[0-9]+\.[0-9]+$ || $new == "$old" ]]; then
+  echo "usage: bump-plugin-version [major | minor | patch | X.Y.Z], X.Y.Z not $old" >&2
+  exit 2
+fi
+
+for f in "$plugin" "$marketplace"; do
+  grep -qE "\"version\": *\"$old\"" "$f" || {
+    echo "bump-plugin-version: $f does not have version $old" >&2
+    exit 1
+  }
+done
+for f in "$plugin" "$marketplace"; do
+  sed -i.bak -E "s/(\"version\": *\")$old\"/\1$new\"/" "$f"
+  rm -f "$f.bak"
+done
+echo "plugin version $old -> $new"

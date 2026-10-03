@@ -72,7 +72,7 @@
                 { nativeBuildInputs = [ pkgs.shellcheck ]; }
                 ''
                   cd ${./.}
-                  shellcheck --shell=bash bin/nix-devshell-cached-exports hooks/*.sh tests/stubs/*
+                  shellcheck --shell=bash bin/nix-devshell-cached-exports hooks/*.sh scripts/* tests/stubs/*
                   touch $out
                 '';
 
@@ -104,6 +104,7 @@
             };
             settings.formatter.shfmt.includes = [
               "bin/nix-devshell-cached-exports"
+              "scripts/*"
               "tests/stubs/*"
             ];
           };
@@ -121,8 +122,14 @@
                 help = "Run shellcheck on the command, hooks and test stubs";
                 command = ''
                   cd "$PRJ_ROOT" &&
-                    shellcheck --shell=bash bin/nix-devshell-cached-exports hooks/*.sh tests/stubs/*
+                    shellcheck --shell=bash bin/nix-devshell-cached-exports hooks/*.sh scripts/* tests/stubs/*
                 '';
+              }
+              {
+                category = "dev";
+                name = "bump-plugin-version";
+                help = "Set the plugin version, needed for any change to hooks/";
+                command = ''"$PRJ_ROOT/scripts/bump-plugin-version" "$@"'';
               }
               {
                 category = "dev";

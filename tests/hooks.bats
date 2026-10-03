@@ -116,10 +116,16 @@ cd() { builtin cd "$@" || return; command -v nix-devshell-cached-exports >/dev/n
 
 # Claude Code fetches a plugin again only when its version changes, so a
 # hook change without a bump never reaches anyone who already installed it.
+# scripts/bump-plugin-version explains this and sets both versions.
+NEEDS_BUMP="run scripts/bump-plugin-version (see its header for why)"
+
 @test "plugin.json and marketplace.json give the plugin the same version" {
   v=$(grep -oE '"version": *"[^"]*"' "$REPO_ROOT/.claude-plugin/plugin.json")
   [ -n "$v" ]
-  grep -qF -- "$v" "$REPO_ROOT/.claude-plugin/marketplace.json"
+  grep -qF -- "$v" "$REPO_ROOT/.claude-plugin/marketplace.json" || {
+    echo "marketplace.json lacks $v from plugin.json; $NEEDS_BUMP"
+    return 1
+  }
 }
 
 @test "every hook change comes with a plugin version bump" {
@@ -128,7 +134,24 @@ cd() { builtin cd "$@" || return; command -v nix-devshell-cached-exports >/dev/n
   if git -C "$REPO_ROOT" diff HEAD -- .claude-plugin/plugin.json | grep -qE '^\+.*"version"'; then
     return
   fi
-  git -C "$REPO_ROOT" diff --quiet HEAD -- hooks
+  git -C "$REPO_ROOT" diff --quiet HEAD -- hooks || {
+    echo "hooks/ has uncommitted changes but the plugin version is unchanged; $NEEDS_BUMP"
+    return 1
+  }
   bump=$(git -C "$REPO_ROOT" log -1 --format=%H -G'"version"' -- .claude-plugin/plugin.json)
-  [ -z "$(git -C "$REPO_ROOT" log --format=%h "$bump..HEAD" -- hooks)" ]
+  since=$(git -C "$REPO_ROOT" log --format='%h %s' "$bump..HEAD" -- hooks)
+  [ -z "$since" ] || {
+    printf 'hooks/ changed after the last plugin version bump, in:\n%s\n%s\n' "$since" "$NEEDS_BUMP"
+    return 1
+  }
+}
+
+@test "bump-plugin-version sets both versions" {
+  cp -R "$REPO_ROOT/.claude-plugin" "$REPO_ROOT/scripts" "$BATS_TEST_TMPDIR/"
+  run "$BATS_TEST_TMPDIR/scripts/bump-plugin-version" 7.8.9
+  [ "$status" -eq 0 ]
+  grep -qF '"version": "7.8.9"' "$BATS_TEST_TMPDIR/.claude-plugin/plugin.json"
+  grep -qF '"version": "7.8.9"' "$BATS_TEST_TMPDIR/.claude-plugin/marketplace.json"
+  run "$BATS_TEST_TMPDIR/scripts/bump-plugin-version" 1.x.2
+  [ "$status" -eq 2 ]
 }
