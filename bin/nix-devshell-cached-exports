@@ -472,6 +472,12 @@ print_hit() {
   [[ -s $cache_file ]] || return 1
   IFS= read -r -d '' text <"$cache_file" || [[ -n $text ]] || return 1
   printf '%s' "$text"
+  # A warning from the capture, shown once: the capture itself may have run
+  # detached (--max-wait), where nobody saw its stderr.
+  if [[ -e ${cache_file%.sh}.warn ]]; then
+    cat -- "${cache_file%.sh}.warn" >&2 || true
+    rm -f -- "${cache_file%.sh}.warn"
+  fi
   exit 0
 }
 
@@ -778,6 +784,25 @@ if ((${#dev_env[@]} == 0)); then
   record_failure "$err_file"
 fi
 
+# A numtide/devshell launcher is installed as $DEVSHELL_DIR/bin/<devshell
+# name>. Named after a command the caller has, it shadows that command, and
+# run with no arguments it starts an interactive shell that waits on stdin.
+warning=
+devshell_dir=${dev_env[DEVSHELL_DIR]-}
+if [[ -n $devshell_dir && -f $devshell_dir/entrypoint ]]; then
+  while IFS= read -r -d '' launcher; do
+    launcher=${launcher##*/}
+    # Another devshell's launcher on the caller's PATH is no real command.
+    if shadowed=$(PATH=$base_path type -P -- "$launcher") &&
+      [[ ! -f ${shadowed%/bin/*}/entrypoint ]]; then
+      warning+="$PROG: warning: in $root, the devshell's launcher shadows $shadowed;"
+      warning+=" running \`$launcher\` there starts an interactive devshell instead."
+      warning+=" Rename the devshell (devshell.name) so it differs from the command."$'\n'
+    fi
+  done < <(find -L "$devshell_dir/bin" -mindepth 1 -maxdepth 1 \
+    -samefile "$devshell_dir/entrypoint" -print0 2>/dev/null)
+fi
+
 # ---------------------------------------------------------------------------
 # Diff -> output
 
@@ -911,6 +936,11 @@ $body$prepend_body"
 new_tmp "$key"
 printf '%s' "$output" >"$tmp"
 mv -f -- "$tmp" "$cache_file"
+if [[ -n $warning ]]; then
+  printf '%s' "$warning" >&2
+  # Kept for the next load too, which may be the first one anybody sees.
+  printf '%s' "$warning" >"$cache_dir/$key.warn" || true
+fi
 
 # Repoint last-good atomically (rename over the old link).
 new_tmp last-good

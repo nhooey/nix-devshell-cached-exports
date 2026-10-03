@@ -188,6 +188,14 @@ from the project root, with stdin closed. Anything a shell hook prints to
 stdout is discarded, and processes it leaves running do not hold the
 capture's lock.
 
+A [numtide/devshell](https://github.com/numtide/devshell) installs a
+launcher named after the devshell in its `bin`. If that name is also a
+command on the caller's `PATH`, the launcher shadows it, and running the
+command in the project starts an interactive devshell instead. The capture
+then prints a warning naming the shadowed command, and the next call prints
+it once more, in case the capture ran in the background. The fix is to give
+the devshell (`devshell.name`) a name of its own.
+
 ### Overrides
 
 Three environment variables change what the capture passes through or

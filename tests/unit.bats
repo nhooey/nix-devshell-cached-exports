@@ -694,3 +694,43 @@ key() {
   [ -e "$dir/$k1.v1.deps" ]
   [ ! -s "$dir/$k1.v1.deps" ]
 }
+
+@test "a devshell launcher named after a command on PATH: warned at capture and once after" {
+  load_fixture flake-minimal
+  cd "$proj"
+  dsd=$BATS_TEST_TMPDIR/devshell-dir
+  mkdir -p "$dsd/bin" "$BATS_TEST_TMPDIR/real-bin"
+  printf '#!/bin/sh\n' >"$dsd/entrypoint"
+  chmod +x "$dsd/entrypoint"
+  ln -s ../entrypoint "$dsd/bin/mycmd"
+  printf '#!/bin/sh\n' >"$BATS_TEST_TMPDIR/real-bin/mycmd"
+  chmod +x "$BATS_TEST_TMPDIR/real-bin/mycmd"
+  set_stub_env "export DEVSHELL_DIR=$dsd
+export FIXTURE_MINIMAL=1"
+  export PATH="$BATS_TEST_TMPDIR/real-bin:$PATH"
+
+  run --separate-stderr ndce
+  [ "$status" -eq 0 ]
+  [[ $stderr == *"launcher shadows $BATS_TEST_TMPDIR/real-bin/mycmd"* ]]
+
+  run --separate-stderr ndce
+  [[ $stderr == *"launcher shadows"* ]]
+
+  run --separate-stderr ndce
+  [ -z "$stderr" ]
+  [[ $output == *FIXTURE_MINIMAL* ]]
+}
+
+@test "a devshell launcher with no command of its name on PATH: no warning" {
+  load_fixture flake-minimal
+  cd "$proj"
+  dsd=$BATS_TEST_TMPDIR/devshell-dir
+  mkdir -p "$dsd/bin"
+  printf '#!/bin/sh\n' >"$dsd/entrypoint"
+  ln -s ../entrypoint "$dsd/bin/ndce-test-no-such-command"
+  set_stub_env "export DEVSHELL_DIR=$dsd"
+
+  run --separate-stderr ndce
+  [ "$status" -eq 0 ]
+  [ -z "$stderr" ]
+}
