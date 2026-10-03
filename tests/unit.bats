@@ -479,3 +479,95 @@ printf ready'
   [ "${#stderr_lines[@]}" -eq 1 ]
   [[ "$stderr" == *--refresh* ]]
 }
+
+# Waits up to 10 s for the cache entry of the current key to appear.
+wait_for_entry() {
+  local path i
+  path=$(ndce --print-cache-path)
+  for i in $(seq 100); do
+    [ -s "$path" ] && return 0
+    sleep 0.1
+  done
+  return 1
+}
+
+@test "--max-wait, capture faster than the wait: prints the exports" {
+  load_fixture flake-minimal
+  cd "$proj"
+
+  run --separate-stderr ndce --max-wait 10
+  [ "$status" -eq 0 ]
+  [ -z "$stderr" ]
+  eval "$output"
+  [ "$FIXTURE_MINIMAL" = "1" ]
+}
+
+@test "--max-wait, slow first capture: returns early with nothing, capture finishes in the background" {
+  load_fixture flake-minimal
+  cd "$proj"
+  export STUB_NIX_SLEEP=3
+
+  start=$SECONDS
+  run --separate-stderr ndce --max-wait 1
+  [ $((SECONDS - start)) -lt 3 ]
+  [ "$status" -eq 0 ]
+  [ -z "$output" ]
+  [[ "$stderr" == *"still capturing"* ]]
+
+  wait_for_entry
+  run ndce
+  [ "$status" -eq 0 ]
+  eval "$output"
+  [ "$FIXTURE_MINIMAL" = "1" ]
+  [ "$(nix_log_lines)" -eq 1 ]
+}
+
+@test "--max-wait, slow capture after an edit: prints the last good environment" {
+  load_fixture flake-minimal
+  cd "$proj"
+
+  run ndce
+  [ "$status" -eq 0 ]
+  good_output=$output
+
+  echo "# edit" >>flake.nix
+  git add -A && git commit -q -m edit
+  export STUB_NIX_SLEEP=3
+
+  run --separate-stderr ndce --max-wait 1
+  [ "$status" -eq 0 ]
+  [ "$output" = "$good_output" ]
+  [[ "$stderr" == *"using the last good environment"* ]]
+
+  wait_for_entry
+  [ "$(nix_log_lines)" -eq 2 ]
+}
+
+@test "--max-wait: repeated calls during one capture start no second capture" {
+  load_fixture flake-minimal
+  cd "$proj"
+  export STUB_NIX_SLEEP=2
+
+  run ndce --max-wait 0
+  [ "$status" -eq 0 ]
+  run ndce --max-wait 0
+  [ "$status" -eq 0 ]
+
+  wait_for_entry
+  [ "$(nix_log_lines)" -eq 1 ]
+}
+
+@test "--max-wait rejects a non-number and --refresh" {
+  load_fixture flake-minimal
+  cd "$proj"
+
+  run --separate-stderr ndce --max-wait soon
+  [ "$status" -eq 2 ]
+  run --separate-stderr ndce --max-wait 5 --refresh
+  [ "$status" -eq 2 ]
+}
+
+# ---------------------------------------------------------------------------
+# Dependencies outside the .nix files
+
+# Writes a git-initialised project at $proj whose flake.nix holds $1.

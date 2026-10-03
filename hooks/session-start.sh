@@ -15,8 +15,20 @@ if [ -z "${CLAUDE_ENV_FILE:-}" ]; then
   exit 0
 fi
 
+# The plugin and the command are installed separately, so the command may
+# predate --max-wait. With it, a Bash command waits at most MAX_WAIT seconds
+# for a capture, then runs with the last good environment; without it, a
+# capture holds up every Bash command until it finishes.
+MAX_WAIT=10
+args=
+if nix-devshell-cached-exports --help 2>/dev/null | grep -qF -- --max-wait; then
+  args=" --max-wait $MAX_WAIT"
+fi
+
 # shellcheck disable=SC2016 # literal text to write to CLAUDE_ENV_FILE, not an expansion here
-line='command -v nix-devshell-cached-exports >/dev/null 2>&1 && eval "$(nix-devshell-cached-exports)"'
+# stdin is closed so that nothing it runs (or anything else on PATH under its
+# name) can wait on input and hold up every Bash command.
+line='command -v nix-devshell-cached-exports >/dev/null 2>&1 && eval "$(nix-devshell-cached-exports'"$args"' </dev/null)"'
 
 if [ ! -f "$CLAUDE_ENV_FILE" ] || ! grep -qF -- "$line" "$CLAUDE_ENV_FILE"; then
   printf '%s\n' "$line" >>"$CLAUDE_ENV_FILE"

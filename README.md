@@ -50,11 +50,14 @@ This repository is both a marketplace and a plugin. From inside a session:
 ```
 
 Its `SessionStart` hook appends
-`command -v nix-devshell-cached-exports >/dev/null 2>&1 && eval "$(nix-devshell-cached-exports)"` to
+`command -v nix-devshell-cached-exports >/dev/null 2>&1 && eval "$(nix-devshell-cached-exports --max-wait 10 </dev/null)"` to
 `$CLAUDE_ENV_FILE`, the file Claude Code prepends to every Bash tool command,
 and starts the command in the background to warm the cache, so a first
-capture overlaps session start-up instead of delaying it (the first Bash
-command waits on the capture's lock rather than starting a second one). If
+capture overlaps session start-up instead of delaying it. A Bash command that
+arrives while a capture is running waits for it at most 10 seconds, then runs
+with the last good environment (or none, before the first capture) and one
+line on stderr saying so; the next command after the capture finishes gets
+the new environment. If
 `nix-devshell-cached-exports` is not on `PATH`, the hook prints one line to
 stderr saying so and how to install it, and otherwise does nothing; the
 session still starts normally. The plugin refers to the command by name
@@ -96,7 +99,7 @@ fi
 ## CLI and behaviour
 
 ```
-nix-devshell-cached-exports [export] [--dir PATH] [--refresh] [--format bash]
+nix-devshell-cached-exports [export] [--dir PATH] [--refresh | --max-wait SECONDS] [--format bash]
 nix-devshell-cached-exports --print-key [--dir PATH]
 nix-devshell-cached-exports --print-cache-path [--dir PATH]
 nix-devshell-cached-exports -h | --help
@@ -106,6 +109,12 @@ nix-devshell-cached-exports -h | --help
 - `--dir PATH` acts as if called from `PATH` (default `$PWD`).
 - `--refresh` ignores any cached entry and failure marker for the current
   key and captures again.
+- `--max-wait SECONDS`, on a cache miss, runs the capture in a detached copy
+  of the command and waits at most `SECONDS` for it. If it is still running
+  by then, the command prints the last good environment (or nothing) with
+  one line on stderr and exits 0; the capture carries on and the next call
+  picks it up. Without it, a call waits for a running capture for up to 15
+  minutes. It cannot be combined with `--refresh`.
 - `--format bash` is the only accepted format today; `fish`/`json` exit 2
   with "not supported yet".
 - `--print-key` prints the cache key and exits; `--print-cache-path` prints

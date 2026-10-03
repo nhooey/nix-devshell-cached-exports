@@ -13,6 +13,10 @@ setup() {
 
   cat >"$STUB_DIR/nix-devshell-cached-exports" <<EOF
 #!/usr/bin/env bash
+if [ "\${1-}" = --help ]; then
+  printf '%s\n' "\${NDCE_STUB_HELP-}"
+  exit 0
+fi
 sleep "\${NDCE_STUB_SLEEP:-0}"
 echo called >>"$STUB_LOG"
 echo 'export NDCE_STUB_OK=1'
@@ -35,7 +39,7 @@ wait_for_calls() {
   return 1
 }
 
-EXPECTED_LINE='command -v nix-devshell-cached-exports >/dev/null 2>&1 && eval "$(nix-devshell-cached-exports)"'
+EXPECTED_LINE='command -v nix-devshell-cached-exports >/dev/null 2>&1 && eval "$(nix-devshell-cached-exports </dev/null)"'
 
 @test "stub on PATH: eval line appended once across two runs, stub invoked for warm-up" {
   PATH="$STUB_DIR:$BARE_PATH" CLAUDE_ENV_FILE="$ENV_FILE" run "$HOOK"
@@ -64,6 +68,12 @@ EXPECTED_LINE='command -v nix-devshell-cached-exports >/dev/null 2>&1 && eval "$
   [ "$status" -eq 0 ]
   [ $(($(date +%s) - start)) -lt 3 ]
   [ "$(grep -cF -- "$EXPECTED_LINE" "$ENV_FILE")" -eq 1 ]
+}
+
+@test "command supports --max-wait: the eval line passes it" {
+  NDCE_STUB_HELP='  --max-wait SECONDS  ...' PATH="$STUB_DIR:$BARE_PATH" CLAUDE_ENV_FILE="$ENV_FILE" run "$HOOK"
+  [ "$status" -eq 0 ]
+  [ "$(cat "$ENV_FILE")" = 'command -v nix-devshell-cached-exports >/dev/null 2>&1 && eval "$(nix-devshell-cached-exports --max-wait 10 </dev/null)"' ]
 }
 
 @test "command absent from PATH: exit 0, one stderr line, env file untouched" {
