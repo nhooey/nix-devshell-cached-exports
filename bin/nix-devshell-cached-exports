@@ -8,7 +8,8 @@
 # The devshell is entered once per change to those files (running its shell
 # hooks there); every other call is root detection, a hash and a `cat`.
 #
-# This script needs bash >= 4.4 and GNU coreutils, git, flock (util-linux).
+# This script needs bash >= 4.4 and GNU coreutils, grep, findutils, git, and
+# flock (util-linux).
 # Its OUTPUT is plain POSIX sh that also sources in bash 3.2 and zsh.
 set -euo pipefail
 unset CDPATH
@@ -196,12 +197,20 @@ cd -- "$root"
 # Key
 
 # Sets `files` to the sorted, de-duplicated list of files (relative to the
-# root, which is the current directory) whose contents make up the key.
+# root, which is the current directory) whose contents make up the key. A
+# shell.nix project also counts untracked files: nix-shell reads them, where
+# a flake cannot.
 list_files() {
   local -a raw=()
   local f prev='' status=0
   if ((in_git)); then
-    mapfile -d '' raw < <(git ls-files -z -- flake.nix flake.lock '*.nix' '*/flake.lock')
+    if [[ $kind == flake ]]; then
+      mapfile -d '' raw < <(git ls-files -z -- flake.nix flake.lock '*.nix' '*/flake.lock')
+    else
+      # git lists the untracked files after the tracked ones.
+      mapfile -d '' raw < <(git ls-files -z --cached --others --exclude-standard -- \
+        flake.nix flake.lock '*.nix' '*/flake.lock' | LC_ALL=C sort -z)
+    fi
     wait "$!" || status=$?
     ((status == 0)) || die "git ls-files failed in $root"
   else
@@ -244,14 +253,197 @@ hash_files() {
   root_hash=${root_hash%% *}
 }
 
-# Sets `key`, `root_hash`, and `cache_file` once `cache_dir` is known.
+# ---------------------------------------------------------------------------
+# Dependencies: files outside the key's own list that the .nix files appear
+# to read. Found by a rough scan, once per change to the .nix files, and kept
+# beside the cache entries as <hash>.<DEPS_VERSION>.deps, so a cache hit
+# costs no scan:
+#
+#   f PATH   a file whose contents join the key
+#   c        a shell.nix project looks up <...> paths: NIX_PATH and the
+#            channels join the key
+#
+# The scan errs towards including too much: a needless file only costs a
+# capture when it changes.
+
+# Bumped whenever the scan changes what it finds, so it scans again.
+readonly DEPS_VERSION=v1
+
+# Lock files that *2nix tools read from a project's source.
+readonly -a LOCK_NAMES=(
+  Cargo.lock package-lock.json npm-shrinkwrap.json yarn.lock pnpm-lock.yaml
+  bun.lock bun.lockb poetry.lock uv.lock Pipfile.lock pdm.lock go.sum
+  gomod2nix.toml Gemfile.lock mix.lock deps-lock.json gradle.lockfile
+  composer.lock pubspec.lock Package.resolved stack.yaml.lock
+  cabal.project.freeze
+)
+# A relative path literal (./x, ../x), a lock file's name, an <...> lookup.
+readonly PATH_RE='(^|[^A-Za-z0-9._+~/-])\.\.?(/[A-Za-z0-9._+-]+)+'
+LOCK_RE=${LOCK_NAMES[*]//./\\.}
+readonly LOCK_RE="(^|[^A-Za-z0-9._-])(${LOCK_RE// /|})([^A-Za-z0-9._-]|\$)"
+readonly ANGLE_RE='<[A-Za-z][A-Za-z0-9._-]*(/[A-Za-z0-9._+-]+)*>'
+readonly UP_RE='^\.\.(/\.\.)*$' # only .. segments
+
+# normalize PATH : sets `normal` to the relative PATH without `.` segments or
+# `dir/..` pairs ("." for the root itself).
+normalize() {
+  local -a segs=() kept=()
+  local s
+  IFS=/ read -r -a segs <<<"$1"
+  for s in ${segs[@]+"${segs[@]}"}; do
+    case $s in
+    '' | .) ;;
+    ..)
+      if ((${#kept[@]})) && [[ ${kept[-1]} != .. ]]; then
+        unset 'kept[-1]'
+      else
+        kept+=(..)
+      fi
+      ;;
+    *) kept+=("$s") ;;
+    esac
+  done
+  local IFS=/
+  normal=${kept[*]-}
+  normal=${normal:-.}
+}
+
+# scan_deps : sets `deps` to the dependency lines for the current `files`.
+# A path literal naming a file adds it; one naming a directory (`src = ./.`)
+# adds the lock files directly in it, and a lock file's name adds the one
+# beside the .nix file that names it. Nested lock files are left out: in
+# `src = ./.` they mostly belong to examples and tests, not the devshell.
+scan_deps() {
+  local -a nix_files=() locks=()
+  local -A dirs=() named=() found=()
+  local f m d p lock angle=0
+  deps=()
+  for f in ${files[@]+"${files[@]}"}; do
+    [[ $f == *.nix ]] && nix_files+=("$f")
+  done
+  ((${#nix_files[@]})) || return 0
+
+  # -H -Z: each match is "FILE\0MATCH\n".
+  while IFS= read -r -d '' f && IFS= read -r m; do
+    if [[ $m == '<'* ]]; then
+      angle=1
+      continue
+    fi
+    [[ $m == [!.A-Za-z]* ]] && m=${m:1}
+    d=.
+    [[ $f == */* ]] && d=${f%/*}
+    if [[ $m == .* ]]; then
+      normalize "$d/$m"
+      if [[ -f $normal ]]; then
+        found[$normal]=1
+      elif [[ $normal =~ $UP_RE ]]; then
+        dirs['.']=1 # a directory above the root holds the root's lock files
+      elif [[ -d $normal ]]; then
+        dirs[$normal]=1
+      fi
+    else
+      normalize "$d/${m%%[!A-Za-z0-9._-]*}"
+      named[$normal]=1
+    fi
+  done < <(grep -oHZE -e "$PATH_RE" -e "$LOCK_RE" -e "$ANGLE_RE" -- "${nix_files[@]}" 2>/dev/null)
+
+  if ((${#dirs[@]} + ${#named[@]})); then
+    if ((in_git)); then
+      mapfile -d '' locks < <(git ls-files -z -- "${LOCK_NAMES[@]}" "${LOCK_NAMES[@]/#/*/}" 2>/dev/null)
+    else
+      local -a names=()
+      for lock in "${LOCK_NAMES[@]}"; do
+        names+=(-o -name "$lock")
+      done
+      mapfile -d '' locks < <(
+        find . \( -name .git -o -name 'result*' -o -name node_modules \) -prune \
+          -o -type f \( "${names[@]:1}" \) -print0 2>/dev/null
+      )
+    fi
+    for lock in ${locks[@]+"${locks[@]}"}; do
+      lock=${lock#./}
+      d=.
+      [[ $lock == */* ]] && d=${lock%/*}
+      if [[ -n ${named[$lock]+set} || -n ${dirs[$d]+set} ]]; then
+        found[$lock]=1
+      fi
+    done
+  fi
+
+  for p in "${!found[@]}"; do
+    [[ $p != *$'\n'* ]] || continue
+    for f in "${files[@]}"; do
+      [[ $p == "$f" ]] && continue 2
+    done
+    deps+=("f $p")
+  done
+  ((! angle)) || [[ $kind == flake ]] || deps+=(c)
+  if ((${#deps[@]})); then
+    mapfile -t deps < <(printf '%s\n' "${deps[@]}" | LC_ALL=C sort)
+  fi
+  return 0
+}
+
+# add_deps : folds the current `hash`'s dependencies into it, scanning for
+# them (and recording what it found) if they are not yet recorded.
+add_deps() {
+  local list=${cache_dir:+$cache_dir/$hash.$DEPS_VERSION.deps} line chan=
+  local -a extra=()
+  deps=()
+  if [[ -n $list && -e $list ]]; then
+    [[ -s $list ]] || return 0 # the common case: nothing to add
+    mapfile -t deps <"$list"
+  else
+    scan_deps
+    # Recording is best-effort: without it the next call scans again.
+    if [[ -n $list ]] && mkdir -p -- "$cache_dir" 2>/dev/null &&
+      printf '%s' "${deps[@]/%/$'\n'}" 2>/dev/null >"$list.$$"; then
+      mv -f -- "$list.$$" "$list" 2>/dev/null || rm -f -- "$list.$$"
+    fi
+    ((${#deps[@]})) || return 0
+  fi
+  for line in "${deps[@]}"; do
+    case $line in
+    'f '*) [[ -f ${line#f } ]] && extra+=("${line#f }") ;;
+    c)
+      chan=$(readlink -f -- ~/.nix-defexpr/channels ~/.nix-defexpr/channels_root \
+        ~/.local/state/nix/profiles/channels /nix/var/nix/profiles/per-user/root/channels \
+        2>/dev/null || true)
+      chan+=$'\n'${NIX_PATH-}
+      ;;
+    esac
+  done
+  hash=$(
+    {
+      printf '%s\n%s\0' "$hash" "$chan"
+      if ((${#extra[@]})); then
+        printf '%s\0' "${extra[@]}"
+        sha256sum -- "${extra[@]}"
+      fi
+    } | sha256sum
+  ) || die "cannot read the files the devshell depends on in $root"
+  hash=${hash:0:32}
+}
+
+# Sets `key`, `root_hash`, `cache_dir`, and `cache_file`.
 compute_key() {
   list_files
   hash_files ${files[@]+"${files[@]}"}
+  if [[ -n $cache_base ]]; then
+    cache_dir=$cache_base/$PROG/${root_hash:0:16}
+  fi
+  add_deps
   key=$hash
   cache_file=${cache_dir:+$cache_dir/$key.sh}
 }
 
+if [[ ${XDG_CACHE_HOME-} == /* ]]; then
+  cache_base=$XDG_CACHE_HOME
+elif [[ -n ${HOME-} ]]; then
+  cache_base=$HOME/.cache
+else
+  cache_base=
+fi
 cache_dir=
 compute_key
 
@@ -263,15 +455,7 @@ fi
 # ---------------------------------------------------------------------------
 # Cache location
 
-if [[ ${XDG_CACHE_HOME-} == /* ]]; then
-  cache_base=$XDG_CACHE_HOME
-elif [[ -n ${HOME-} ]]; then
-  cache_base=$HOME/.cache
-else
-  die "cannot locate the cache: neither XDG_CACHE_HOME nor HOME is set"
-fi
-cache_dir=$cache_base/$PROG/${root_hash:0:16}
-cache_file=$cache_dir/$key.sh
+[[ -n $cache_base ]] || die "cannot locate the cache: neither XDG_CACHE_HOME nor HOME is set"
 
 if [[ $mode == print-cache-path ]]; then
   printf '%s\n' "$cache_file"

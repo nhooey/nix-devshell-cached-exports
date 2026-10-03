@@ -571,3 +571,126 @@ wait_for_entry() {
 # Dependencies outside the .nix files
 
 # Writes a git-initialised project at $proj whose flake.nix holds $1.
+make_flake() {
+  proj=$BATS_TEST_TMPDIR/proj
+  mkdir -p "$proj"
+  printf '%s\n' "$1" >"$proj/flake.nix"
+  (cd "$proj" && git init -q -b main && git add -A && git commit -q -m init)
+  proj=$(cd -P "$proj" && pwd)
+  cd "$proj"
+}
+
+key() {
+  run ndce --print-key
+  [ "$status" -eq 0 ]
+  printf '%s' "$output"
+}
+
+@test "deps: a file a .nix file names by relative path joins the key" {
+  make_flake '{ outputs = _: { x = builtins.readFile ./scripts/setup.sh; y = ../outside.txt; }; }'
+  mkdir scripts
+  echo one >scripts/setup.sh
+  echo other >README.md
+  k1=$(key)
+
+  echo two >scripts/setup.sh
+  k2=$(key)
+  [ "$k2" != "$k1" ]
+
+  echo changed >README.md
+  [ "$(key)" = "$k2" ]
+
+  # Paths are resolved from the .nix file's own directory.
+  mkdir -p nix
+  printf '{ a = import ../scripts/setup.sh; }\n' >nix/sub.nix
+  git add -A && git commit -q -m sub
+  k3=$(key)
+  echo three >scripts/setup.sh
+  [ "$(key)" != "$k3" ]
+}
+
+@test "deps: lock files join the key when named beside a .nix file or in a directory one names" {
+  make_flake '{ outputs = _: { }; }'
+  mkdir -p rust examples/web
+  echo a >Cargo.lock
+  echo a >rust/Cargo.lock
+  echo a >examples/web/package-lock.json
+  git add -A && git commit -q -m locks
+  k1=$(key)
+
+  # Not referenced: editing it does not change the key.
+  echo b >Cargo.lock
+  [ "$(key)" = "$k1" ]
+
+  # Named in a .nix file: the one beside it counts, not a nested one.
+  printf '{ outputs = _: { lock = "Cargo.lock"; }; }\n' >flake.nix
+  git add -A && git commit -q -m named
+  k2=$(key)
+  echo b >rust/Cargo.lock
+  [ "$(key)" = "$k2" ]
+  echo c >Cargo.lock
+  [ "$(key)" != "$k2" ]
+
+  # In a directory a path literal names.
+  printf '{ outputs = _: { lock = "${./rust}/x"; }; }\n' >flake.nix
+  git add -A && git commit -q -m dir
+  k3=$(key)
+  echo c >rust/Cargo.lock
+  [ "$(key)" != "$k3" ]
+
+  # `src = ./.` counts the root's lock files, not nested ones.
+  printf '{ outputs = _: { src = ./.; }; }\n' >flake.nix
+  git add -A && git commit -q -m src
+  k4=$(key)
+  echo b >examples/web/package-lock.json
+  [ "$(key)" = "$k4" ]
+  echo d >Cargo.lock
+  [ "$(key)" != "$k4" ]
+}
+
+@test "deps: a deleted dependency changes the key" {
+  make_flake '{ outputs = _: { x = builtins.readFile ./data.json; }; }'
+  echo '{}' >data.json
+  k1=$(key)
+  rm data.json
+  [ "$(key)" != "$k1" ]
+}
+
+@test "deps: a shell.nix project counts untracked .nix files; a flake does not" {
+  load_fixture shell-nix
+  cd "$proj"
+  k1=$(key)
+  echo '{ }' >extra.nix
+  [ "$(key)" != "$k1" ]
+
+  rm extra.nix
+  make_flake '{ outputs = _: { }; }'
+  k2=$(key)
+  echo '{ }' >extra.nix
+  [ "$(key)" = "$k2" ]
+}
+
+@test "deps: a shell.nix with <...> lookups keys on NIX_PATH; a flake does not" {
+  load_fixture shell-nix
+  cd "$proj"
+  printf '{ pkgs ? import <nixpkgs> { } }: pkgs.mkShellNoCC { }\n' >shell.nix
+  git add -A && git commit -q -m angle
+  k1=$(NIX_PATH=nixpkgs=/a key)
+  [ "$(NIX_PATH=nixpkgs=/a key)" = "$k1" ]
+  [ "$(NIX_PATH=nixpkgs=/b key)" != "$k1" ]
+
+  make_flake '{ outputs = _: { x = <nixpkgs>; }; }'
+  k2=$(NIX_PATH=nixpkgs=/a key)
+  [ "$(NIX_PATH=nixpkgs=/b key)" = "$k2" ]
+}
+
+@test "deps: a project with none keeps its key, and records the scan once" {
+  load_fixture flake-minimal
+  cd "$proj"
+  k1=$(key)
+  run ndce --print-cache-path
+  dir=${output%/*}
+  # The key of a project without dependencies is the .nix files' own hash.
+  [ -e "$dir/$k1.v1.deps" ]
+  [ ! -s "$dir/$k1.v1.deps" ]
+}

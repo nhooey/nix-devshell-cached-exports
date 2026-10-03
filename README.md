@@ -129,6 +129,7 @@ nix-devshell-cached-exports -h | --help
 ${XDG_CACHE_HOME:-$HOME/.cache}/nix-devshell-cached-exports/<rootid>/
   <key>.sh        # a good capture (the exact text printed)
   <key>.failed    # failure marker: tail of nix's stderr
+  <hash>.v1.deps  # other files the .nix files with this hash depend on
   last-good       # symlink -> <key>.sh of the most recent good capture
   .lock           # flock target
 ```
@@ -139,8 +140,31 @@ though it shares the main checkout's history. `<key>` is the first 32 hex
 characters of a sha256 over a format-version tag, the project kind, the
 sorted names, and the sha256 of each file that defines the devshell (`flake.nix`,
 `flake.lock`, every tracked `*.nix`, and any path-input sub-flake's
-`flake.lock`). Editing any of those files produces a new key and a fresh
-capture on the next call.
+`flake.lock`). A `shell.nix` or `default.nix` project also counts untracked
+`*.nix` files, which nix-shell reads and a flake cannot. Editing any of those
+files produces a new key and a fresh capture on the next call.
+
+When those files change, a rough scan of the `*.nix` files finds what else
+the devshell may read, records it in `<hash>.v1.deps`, and folds it into the
+key:
+
+- a file named by a relative path literal, such as
+  `builtins.readFile ./scripts/setup.sh`, resolved from the `.nix` file's
+  own directory;
+- a known lock file (`Cargo.lock`, `package-lock.json`, `yarn.lock`,
+  `pnpm-lock.yaml`, `poetry.lock`, `uv.lock`, `go.sum`, `gomod2nix.toml`,
+  `Gemfile.lock`, `mix.lock`, `deps-lock.json`, …) beside a `.nix` file that
+  names it, or directly in a directory a path literal names (as `src = ./.;`
+  names the project root). Lock files further down, which mostly belong to
+  examples and tests, are left out;
+- for a `shell.nix` or `default.nix` that looks up `<...>` paths, `NIX_PATH`
+  and the targets of the channel profiles, so a channel update recaptures.
+
+The scan errs towards including too much: an extra file only costs a capture
+when it changes. A cache hit never scans: it reads `<hash>.v1.deps`, which is
+empty for most projects, and hashes the files it lists. Dependencies the scan
+cannot see, such as an unpinned `fetchTarball` or a path built from strings,
+still need `--refresh`.
 
 ### Failure fallback
 
