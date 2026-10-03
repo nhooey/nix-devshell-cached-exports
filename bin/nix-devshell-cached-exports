@@ -19,6 +19,8 @@ readonly FORMAT_VERSION=ndce-v1
 readonly IDENT_CHARS=ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_
 readonly LOCK_TIMEOUT=900
 readonly FAILED_TAIL_LINES=50
+# A capture deletes this project's cache files untouched for longer than this.
+readonly PRUNE_DAYS=30
 
 # The packaged command (package.nix) sets __NDCE_TOOLS_PATH to its pinned
 # tools. They go in front of PATH for this script only; the devshell capture
@@ -390,6 +392,7 @@ add_deps() {
   local list=${cache_dir:+$cache_dir/$hash.$DEPS_VERSION.deps} line chan=
   local -a extra=()
   deps=()
+  deps_file=$list
   if [[ -n $list && -e $list ]]; then
     [[ -s $list ]] || return 0 # the common case: nothing to add
     mapfile -t deps <"$list"
@@ -947,5 +950,13 @@ new_tmp last-good
 ln -sf -- "$key.sh" "$tmp"
 mv -f -- "$tmp" "$cache_dir/last-good"
 rm -f -- "$cache_dir/$key.failed" "$cache_dir/$pre_key.failed"
+
+# Prune: entries for old versions of the .nix files, their records and
+# failure markers, and temp files a killed call left behind. Only a capture
+# prunes, so a cache hit costs nothing; an old entry pruned while still in
+# use (another branch, say) costs one capture.
+find "$cache_dir" -mindepth 1 -maxdepth 1 -type f -mtime +"$PRUNE_DAYS" \
+  ! -name .lock ! -name "$key.*" ! -name "${deps_file##*/}" \
+  -delete 2>/dev/null || true
 
 printf '%s' "$output"

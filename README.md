@@ -166,6 +166,14 @@ empty for most projects, and hashes the files it lists. Dependencies the scan
 cannot see, such as an unpinned `fetchTarball` or a path built from strings,
 still need `--refresh`.
 
+Each successful capture also deletes the project's cache files that have not
+been written for 30 days, other than the new entry, `last-good` and `.lock`:
+entries for old versions of the `.nix` files, their records and failure
+markers, and temp files a killed call left behind. A cache hit does not
+refresh an entry's age, so an old entry still in use, such as another
+branch's, is pruned and costs one capture the next time. Directories of
+projects that no longer exist are left in place; delete them by hand.
+
 ### Failure fallback
 
 If capturing fails — now, or as remembered by a `<key>.failed` marker from an

@@ -734,3 +734,32 @@ export FIXTURE_MINIMAL=1"
   [ "$status" -eq 0 ]
   [ -z "$stderr" ]
 }
+
+@test "a capture prunes this project's cache files untouched for 30 days, and nothing else" {
+  load_fixture flake-minimal
+  cd "$proj"
+  run ndce
+  [ "$status" -eq 0 ]
+  run ndce --print-cache-path
+  cache_file=$output
+  dir=${cache_file%/*}
+  k=$(key)
+  printf 'x' >"$dir/0123456789abcdef0123456789abcdef.sh"
+  printf 'x' >"$dir/0123456789abcdef0123456789abcdef.failed"
+  printf 'x' >"$dir/.$k.sh.AbCdEf"
+  printf 'x' >"$dir/fedcba9876543210fedcba9876543210.sh"
+  touch -d '40 days ago' "$dir/0123456789abcdef0123456789abcdef.sh" \
+    "$dir/0123456789abcdef0123456789abcdef.failed" "$dir/.$k.sh.AbCdEf" \
+    "$dir/$k.sh" "$dir/$k.v1.deps" "$dir/.lock"
+
+  run ndce --refresh
+  [ "$status" -eq 0 ]
+  [ ! -e "$dir/0123456789abcdef0123456789abcdef.sh" ]
+  [ ! -e "$dir/0123456789abcdef0123456789abcdef.failed" ]
+  [ ! -e "$dir/.$k.sh.AbCdEf" ]
+  [ -e "$dir/fedcba9876543210fedcba9876543210.sh" ]
+  [ -e "$dir/$k.v1.deps" ]
+  [ -e "$dir/.lock" ]
+  [ -s "$cache_file" ]
+  [ -L "$dir/last-good" ]
+}
