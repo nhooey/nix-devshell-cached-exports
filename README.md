@@ -123,9 +123,9 @@ install it and otherwise does nothing.
   error. Ways around it:
   - work from the right directory: start the session there, or use
     `EnterWorktree` or the `worktree-worker` agent;
-  - make devshell commands find their checkout from where they run
-    (`git rev-parse --show-toplevel`) instead of trusting an inherited
-    `PRJ_ROOT`.
+  - make devshell commands find their checkout from where they run,
+    instead of trusting an inherited `PRJ_ROOT`. See
+    [Finding the checkout at run time](#finding-the-checkout-at-run-time).
 - **The first load in a new directory waits.** A new worktree has its own
   cache, so the first command or `cd` there waits up to 10 seconds for a
   capture, and the devshell's shell hooks run there.
@@ -147,6 +147,66 @@ install it and otherwise does nothing.
 - **The `nix develop` reminder matches command text.** It misses commands
   with options between `nix develop` and `--command`, and anything inside a
   script.
+
+### Finding the checkout at run time
+
+Root variables such as numtide/devshell's `PRJ_ROOT` and devenv's
+`DEVENV_ROOT` are set once, when the devshell is entered. Any process
+started from there inherits them, even after changing to another checkout.
+A devshell command that should act on the checkout it runs in can find that
+checkout itself, each time it runs. Nix has no built-in way to do this
+([NixOS/nix#8034](https://github.com/NixOS/nix/issues/8034),
+[#6241](https://github.com/NixOS/nix/issues/6241)). The two common ways:
+
+**With git:**
+
+```bash
+root=$(git rev-parse --show-toplevel) || exit
+PYTHONPATH="$root/src" exec python -m app "$@"
+```
+
+- Pros: nothing to add to the flake, and git is almost always on `PATH`.
+  Inside a worktree it returns the worktree, even one nested inside the main
+  checkout.
+- Cons: it works only inside a git checkout, so not in a tarball or a
+  `path:` copy, and it stops at the git root. A flake in a subdirectory of
+  the repository needs `$root/subdir`.
+
+**With [flake-root](https://github.com/srid/flake-root)**, a flake-parts
+module:
+
+```nix
+{
+  inputs.flake-root.url = "github:srid/flake-root";
+  outputs = inputs@{ flake-parts, ... }:
+    flake-parts.lib.mkFlake { inherit inputs; } {
+      imports = [ inputs.flake-root.flakeModule ];
+      perSystem = { config, lib, pkgs, ... }: {
+        packages.app = pkgs.writeShellScriptBin "app" ''
+          root=$(${lib.getExe config.flake-root.package}) || exit
+          PYTHONPATH="$root/src" exec ${pkgs.python3}/bin/python -m app "$@"
+        '';
+      };
+    };
+}
+```
+
+Its `flake-root` program walks up from the current directory to the nearest
+`flake.nix` (or the file named by `flake-root.projectRootFile`), prints that
+directory, and exits 1 if there is none.
+
+- Pros: it finds the flake itself, wherever it sits in the repository, and
+  works without git. The walk is plain shell, with no `git` process.
+- Cons: it needs flake-parts and one more input. Its marker check matches
+  files only, so `projectRootFile = ".git"` would work in worktrees but not
+  in a main checkout, where `.git` is a directory.
+
+Don't use flake-root's `config.flake-root.devShell`: it sets `FLAKE_ROOT`
+in a shell hook, once at entry, so it goes stale just like `PRJ_ROOT`. Use
+the program inside each command.
+
+Either way, an interactive shell can keep using `PRJ_ROOT`; only commands
+that may run from another directory need to find the root themselves.
 
 ## Other ways to load it
 
