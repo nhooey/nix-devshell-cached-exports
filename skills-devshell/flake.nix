@@ -25,14 +25,11 @@
     };
 
     # skills-nix: only nix-flakes is cherry-picked below.
-    # skills-nix still names its builder input `flake-skills` (agent-skill-flake
-    # is that repo renamed), followed onto our node to collapse the builder.
     skills-nix = {
       url = "github:nhooey/skills-nix";
       inputs = {
         nixpkgs.follows = "nixpkgs";
-        flake-skills.follows = "agent-skill-flake";
-        skills-git.follows = "skills-git";
+        agent-skill-flake.follows = "agent-skill-flake";
       };
     };
   };

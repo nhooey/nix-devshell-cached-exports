@@ -43,8 +43,12 @@
         inputs.treefmt-nix.flakeModule
       ];
 
+      # numtide/devshell installs its launcher as $DEVSHELL_DIR/bin/<name>,
+      # so the name must not be the command's: inside this devshell it would
+      # shadow the real command, and with no arguments start an interactive
+      # shell that waits on stdin.
       agent-skill-flake.devshellSkills = {
-        name = "nix-devshell-cached-exports";
+        name = "nix-devshell-cached-exports-dev";
       };
 
       perSystem =
