@@ -88,6 +88,13 @@ yet, or that runs outside any project, takes the previous project's
 environment back out, so a command fails to find that project's tools
 rather than running them against the wrong checkout.
 
+The function is defined only in the shell that runs the Bash command, so a
+`cd` in a child process (`bash -c '…'`, a script) changes directory without
+loading, and the child keeps the parent's environment, `PRJ_ROOT` included.
+A devshell command that should act on the checkout it runs in should find
+it from its directory (`git rev-parse --show-toplevel`) rather than trust an
+inherited `PRJ_ROOT`.
+
 Only `SessionStart` adds those lines, and `/reload-plugins` does not run it:
 a session that installs or enables the plugin partway through gets the
 devshell after a restart (`claude --resume` keeps the conversation).
