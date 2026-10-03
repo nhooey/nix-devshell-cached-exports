@@ -128,30 +128,33 @@ NEEDS_BUMP="run scripts/bump-plugin-version (see its header for why)"
   }
 }
 
+# .claude-plugin/hooks.sha256 holds the version and hooks/ hash that
+# bump-plugin-version last wrote, so a hooks/ change without a bump shows as
+# a hash mismatch. `nix flake check` patches the hooks' shebangs, so it sets
+# NDCE_TEST_HOOKS_SOURCE to the hooks/ it was given.
 @test "every hook change comes with a plugin version bump" {
-  git -C "$REPO_ROOT" rev-parse --verify -q HEAD >/dev/null 2>&1 || skip "needs the git history"
-  # A bump not yet committed covers every change before it.
-  if git -C "$REPO_ROOT" diff HEAD -- .claude-plugin/plugin.json | grep -qE '^\+.*"version"'; then
-    return
-  fi
-  git -C "$REPO_ROOT" diff --quiet HEAD -- hooks || {
-    echo "hooks/ has uncommitted changes but the plugin version is unchanged; $NEEDS_BUMP"
+  read -r version hash <"$REPO_ROOT/.claude-plugin/hooks.sha256"
+  grep -qE "\"version\": *\"$version\"" "$REPO_ROOT/.claude-plugin/plugin.json" || {
+    echo ".claude-plugin/hooks.sha256 has version $version, not plugin.json's; $NEEDS_BUMP"
     return 1
   }
-  bump=$(git -C "$REPO_ROOT" log -1 --format=%H -G'"version"' -- .claude-plugin/plugin.json)
-  since=$(git -C "$REPO_ROOT" log --format='%h %s' "$bump..HEAD" -- hooks)
-  [ -z "$since" ] || {
-    printf 'hooks/ changed after the last plugin version bump, in:\n%s\n%s\n' "$since" "$NEEDS_BUMP"
+  current=$("$REPO_ROOT/scripts/bump-plugin-version" --print-hooks-hash "${NDCE_TEST_HOOKS_SOURCE:-$REPO_ROOT/hooks}")
+  [ "$hash" = "$current" ] || {
+    echo "hooks/ changed since plugin version $version but the version is unchanged; $NEEDS_BUMP"
     return 1
   }
 }
 
-@test "bump-plugin-version sets both versions" {
-  cp -R "$REPO_ROOT/.claude-plugin" "$REPO_ROOT/scripts" "$BATS_TEST_TMPDIR/"
+@test "bump-plugin-version sets both versions and records the hooks/ hash" {
+  cp -R "$REPO_ROOT/.claude-plugin" "$REPO_ROOT/hooks" "$REPO_ROOT/scripts" "$BATS_TEST_TMPDIR/"
+  echo '# changed' >>"$BATS_TEST_TMPDIR/hooks/session-start.sh"
   run "$BATS_TEST_TMPDIR/scripts/bump-plugin-version" 7.8.9
   [ "$status" -eq 0 ]
   grep -qF '"version": "7.8.9"' "$BATS_TEST_TMPDIR/.claude-plugin/plugin.json"
   grep -qF '"version": "7.8.9"' "$BATS_TEST_TMPDIR/.claude-plugin/marketplace.json"
+  hash=$("$BATS_TEST_TMPDIR/scripts/bump-plugin-version" --print-hooks-hash)
+  [ "$hash" != "$("$REPO_ROOT/scripts/bump-plugin-version" --print-hooks-hash)" ]
+  [ "$(cat "$BATS_TEST_TMPDIR/.claude-plugin/hooks.sha256")" = "7.8.9 $hash" ]
   run "$BATS_TEST_TMPDIR/scripts/bump-plugin-version" 1.x.2
   [ "$status" -eq 2 ]
 }

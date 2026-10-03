@@ -83,9 +83,10 @@
               cp -r ${./.} src
               chmod -R u+w src
               cd src
-              patchShebangs bin hooks tests
+              patchShebangs bin hooks scripts tests
               export HOME=$TMPDIR/home
               mkdir -p "$HOME"
+              export NDCE_TEST_HOOKS_SOURCE=${./.}/hooks
               bats tests/unit.bats tests/hooks.bats
               touch $out
             '';

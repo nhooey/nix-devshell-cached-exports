@@ -11,8 +11,7 @@ There is no CI. Before committing, run these in the devshell (`nix develop`):
 - `test`: unit and hook suites, stubbed nix
 - `test-e2e`: the same scenarios against real nix
 - `lint`, and `nix fmt`
-- `nix flake check`. It cannot see git history, so also run `test` to get
-  the plugin version check.
+- `nix flake check`
 
 ## Changing the plugin
 

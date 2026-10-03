@@ -1,19 +1,36 @@
 #!/usr/bin/env bash
 # Sets the Claude Code plugin's version in .claude-plugin/plugin.json and in
-# its .claude-plugin/marketplace.json entry.
+# its .claude-plugin/marketplace.json entry, and records the new version with
+# a hash of hooks/ in .claude-plugin/hooks.sha256.
 #
 # Claude Code fetches an installed plugin again only when this version
 # changes: `/plugin update` reports "already at the latest version" and
 # `/reload-plugins` reloads the cached copy. So any change to the plugin's
 # files (hooks/) needs a bump, or it never reaches anyone who installed it.
-# tests/hooks.bats fails until there is one.
+# tests/hooks.bats fails while hooks.sha256 does not match hooks/ and
+# plugin.json, and this script is the only thing that writes it.
 #
 # Usage: bump-plugin-version [major | minor | patch | X.Y.Z]   (default: minor)
+#        bump-plugin-version --print-hooks-hash [DIR]   (hash of hooks/, or DIR)
 set -euo pipefail
 
 root=$(cd "$(dirname "$0")/.." && pwd)
 plugin=$root/.claude-plugin/plugin.json
 marketplace=$root/.claude-plugin/marketplace.json
+hashfile=$root/.claude-plugin/hooks.sha256
+
+# A sha256 over the sorted relative paths and contents of every file under
+# hooks/, or under the directory given.
+hooks_hash() (
+  cd "${1:-$root/hooks}"
+  find . -type f -print0 | LC_ALL=C sort -z | xargs -0 sha256sum -- |
+    sha256sum | cut -d' ' -f1
+)
+
+if [[ ${1-} == --print-hooks-hash ]]; then
+  hooks_hash "${2-}"
+  exit
+fi
 
 old=$(grep -oE '"version": *"[0-9]+\.[0-9]+\.[0-9]+"' "$plugin" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')
 IFS=. read -r major minor patch <<<"$old"
@@ -36,8 +53,10 @@ for f in "$plugin" "$marketplace"; do
     exit 1
   }
 done
+hash=$(hooks_hash)
 for f in "$plugin" "$marketplace"; do
   sed -i.bak -E "s/(\"version\": *\")$old\"/\1$new\"/" "$f"
   rm -f "$f.bak"
 done
+printf '%s %s\n' "$new" "$hash" >"$hashfile"
 echo "plugin version $old -> $new"
