@@ -690,11 +690,11 @@ passthrough=("${list[@]}")
 words NDCE_EXCLUDE TMPDIR TMP TEMP TEMPDIR NIX_BUILD_TOP SHLVL PWD OLDPWD _ \
   __CF_USER_TEXT_ENCODING 'BASH_*' BASHOPTS SHELLOPTS SHELL
 exclude=("${list[@]}")
-# Names that look like secrets, as shell patterns matched without regard to
-# case: the cache is a file on disk, so their values are left out of it.
-words NDCE_SECRET_VARS '*TOKEN*' '*SECRET*' '*PASSWORD*' '*PASSWD*' \
-  '*PASSPHRASE*' '*CREDENTIAL*' '*API_KEY*' '*ACCESS_KEY*' '*PRIVATE_KEY*'
-secret_vars=("${list[@]}")
+# Variables left out of the cache, as shell patterns matched without regard
+# to case. None by default: a devshell that reads a secret from a file has
+# it on disk already, and leaving it out breaks what needs it.
+words NDCE_SECRET_VARS
+secret_vars=(${list[@]+"${list[@]}"})
 words NDCE_PREPEND_VARS PATH XDG_DATA_DIRS
 prepend_vars=()
 for v in "${list[@]}"; do
@@ -1051,8 +1051,7 @@ if [[ -n $prepend_body ]]; then
 "
 fi
 if [[ -n $secrets ]]; then
-  warning+="$PROG: in $root, left out of the cache as they look like secrets:$secrets."
-  warning+=" Load them another way, or change NDCE_SECRET_VARS."$'\n'
+  warning+="$PROG: in $root, left out of the cache by NDCE_SECRET_VARS, so not set:$secrets."$'\n'
 fi
 
 # The store path a cache hit checks is still there: the first one the PATH

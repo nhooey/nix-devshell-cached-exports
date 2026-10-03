@@ -207,12 +207,14 @@ Either way an entry's header names a store path its `PATH` needs, and a load
 that finds it gone captures again instead of loading a `PATH` that points at
 nothing.
 
-The cache directory is readable only by its owner, but it is still a file on
-disk. Variables whose names look like secrets (matching `*TOKEN*`,
-`*SECRET*`, `*PASSWORD*`, `*PASSWD*`, `*PASSPHRASE*`, `*CREDENTIAL*`,
-`*API_KEY*`, `*ACCESS_KEY*` or `*PRIVATE_KEY*`, in any case) are left out of
-it, with a warning naming them; load those another way, or set
-`NDCE_SECRET_VARS` to change the patterns (empty keeps everything).
+The cache directory is readable only by its owner, but it is still on disk,
+in backups, and readable by anything running as that user. A devshell that
+reads a secret from a file in the project has it on disk already, so by
+default every variable is cached. One that fetches a secret at entry, from a
+keychain or password manager, would get its first copy on disk from the
+cache: set `NDCE_SECRET_VARS` to space-separated shell patterns (matched in
+any case, such as `*TOKEN* *SECRET* *PASSWORD*`) and matching variables are
+left out of it, with a warning naming them, so load those another way.
 
 ### Failure fallback
 

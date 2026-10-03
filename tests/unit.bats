@@ -822,29 +822,31 @@ fake_store() {
   [[ $output != *"export "* ]]
 }
 
-@test "secret-looking variables and SHELL stay out of the cache, with a warning" {
+@test "by default every variable but SHELL is cached, in an owner-only directory" {
   load_fixture flake-minimal
   cd "$proj"
-  set_stub_env 'export HF_TOKEN=tok-value MY_Password=pw-value SHELL=/bin/devshell-bash KEEP_ME=1'
-
+  set_stub_env 'export HF_TOKEN=tok-value SHELL=/bin/devshell-bash'
   run --separate-stderr ndce
   [ "$status" -eq 0 ]
-  [[ $output == *"KEEP_ME"* ]]
-  [[ $output != *tok-value* && $output != *pw-value* && $output != *SHELL=* ]]
-  [[ $stderr == *"look like secrets: HF_TOKEN MY_Password."* ]]
+  [[ $output == *"HF_TOKEN='tok-value'"* ]]
+  [[ $output != *SHELL=* ]]
+  [ -z "$stderr" ]
   run ndce --print-cache-path
-  ! grep -q -e tok-value -e pw-value "$output"
   [ "$(stat -c %a "${output%/*}")" = 700 ]
 }
 
-@test "NDCE_SECRET_VARS set empty caches every variable" {
+@test "NDCE_SECRET_VARS keeps matching variables out of the cache, with a warning" {
   load_fixture flake-minimal
   cd "$proj"
-  set_stub_env 'export HF_TOKEN=tok-value'
-  NDCE_SECRET_VARS= run --separate-stderr ndce
+  set_stub_env 'export HF_TOKEN=tok-value MY_Password=pw-value KEEP_ME=1'
+
+  NDCE_SECRET_VARS='*TOKEN* *PASSWORD*' run --separate-stderr ndce
   [ "$status" -eq 0 ]
-  [[ $output == *"HF_TOKEN='tok-value'"* ]]
-  [ -z "$stderr" ]
+  [[ $output == *"KEEP_ME"* ]]
+  [[ $output != *tok-value* && $output != *pw-value* ]]
+  [[ $stderr == *"left out of the cache by NDCE_SECRET_VARS, so not set: HF_TOKEN MY_Password."* ]]
+  run ndce --print-cache-path
+  ! grep -q -e tok-value -e pw-value "$output"
 }
 
 # flake-minimal with a flake.lock, so that a capture may use a copy.
