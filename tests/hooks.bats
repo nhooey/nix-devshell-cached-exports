@@ -1,5 +1,5 @@
 #!/usr/bin/env bats
-# Tests for hooks/session-start.sh, the plugin's SessionStart hook.
+# Tests for the plugin's hooks (hooks/*.sh) and its version records.
 # Sandbox-safe: no network access, no writes outside $BATS_TEST_TMPDIR.
 
 setup() {
@@ -15,6 +15,11 @@ setup() {
 #!/usr/bin/env bash
 if [ "\${1-}" = --help ]; then
   printf '%s\n' "\${NDCE_STUB_HELP-}"
+  exit 0
+fi
+if [ "\${1-}" = --print-key ]; then
+  echo "\$*" >>"$STUB_LOG.print-key"
+  [ -n "\${NDCE_STUB_NO_PROJECT-}" ] || echo 0123456789abcdef
   exit 0
 fi
 sleep "\${NDCE_STUB_SLEEP:-0}"
@@ -128,33 +133,85 @@ NEEDS_BUMP="run scripts/bump-plugin-version (see its header for why)"
   }
 }
 
-# .claude-plugin/hooks.sha256 holds the version and hooks/ hash that
-# bump-plugin-version last wrote, so a hooks/ change without a bump shows as
-# a hash mismatch. `nix flake check` patches the hooks' shebangs, so it sets
-# NDCE_TEST_HOOKS_SOURCE to the hooks/ it was given.
-@test "every hook change comes with a plugin version bump" {
-  read -r version hash <"$REPO_ROOT/.claude-plugin/hooks.sha256"
+# .claude-plugin/plugin-files.sha256 holds the version and plugin files'
+# hash that bump-plugin-version last wrote, so a change to those files
+# without a bump shows as a hash mismatch. `nix flake check` patches the
+# hooks' shebangs, so it sets NDCE_TEST_PLUGIN_SOURCE to the unpatched tree.
+@test "every plugin file change comes with a plugin version bump" {
+  read -r version hash <"$REPO_ROOT/.claude-plugin/plugin-files.sha256"
   grep -qE "\"version\": *\"$version\"" "$REPO_ROOT/.claude-plugin/plugin.json" || {
-    echo ".claude-plugin/hooks.sha256 has version $version, not plugin.json's; $NEEDS_BUMP"
+    echo ".claude-plugin/plugin-files.sha256 has version $version, not plugin.json's; $NEEDS_BUMP"
     return 1
   }
-  current=$("$REPO_ROOT/scripts/bump-plugin-version" --print-hooks-hash "${NDCE_TEST_HOOKS_SOURCE:-$REPO_ROOT/hooks}")
+  current=$("$REPO_ROOT/scripts/bump-plugin-version" --print-plugin-hash "${NDCE_TEST_PLUGIN_SOURCE:-$REPO_ROOT}")
   [ "$hash" = "$current" ] || {
-    echo "hooks/ changed since plugin version $version but the version is unchanged; $NEEDS_BUMP"
+    echo "the plugin's files changed since version $version but the version is unchanged; $NEEDS_BUMP"
     return 1
   }
 }
 
-@test "bump-plugin-version sets both versions and records the hooks/ hash" {
-  cp -R "$REPO_ROOT/.claude-plugin" "$REPO_ROOT/hooks" "$REPO_ROOT/scripts" "$BATS_TEST_TMPDIR/"
-  echo '# changed' >>"$BATS_TEST_TMPDIR/hooks/session-start.sh"
+@test "bump-plugin-version sets both versions and records the plugin files' hash" {
+  cp -R "$REPO_ROOT/.claude-plugin" "$REPO_ROOT/agents" "$REPO_ROOT/hooks" "$REPO_ROOT/scripts" "$BATS_TEST_TMPDIR/"
+  echo '# changed' >>"$BATS_TEST_TMPDIR/agents/worktree-worker.md"
   run "$BATS_TEST_TMPDIR/scripts/bump-plugin-version" 7.8.9
   [ "$status" -eq 0 ]
   grep -qF '"version": "7.8.9"' "$BATS_TEST_TMPDIR/.claude-plugin/plugin.json"
   grep -qF '"version": "7.8.9"' "$BATS_TEST_TMPDIR/.claude-plugin/marketplace.json"
-  hash=$("$BATS_TEST_TMPDIR/scripts/bump-plugin-version" --print-hooks-hash)
-  [ "$hash" != "$("$REPO_ROOT/scripts/bump-plugin-version" --print-hooks-hash)" ]
-  [ "$(cat "$BATS_TEST_TMPDIR/.claude-plugin/hooks.sha256")" = "7.8.9 $hash" ]
+  hash=$("$BATS_TEST_TMPDIR/scripts/bump-plugin-version" --print-plugin-hash)
+  [ "$hash" != "$("$REPO_ROOT/scripts/bump-plugin-version" --print-plugin-hash)" ]
+  [ "$(cat "$BATS_TEST_TMPDIR/.claude-plugin/plugin-files.sha256")" = "7.8.9 $hash" ]
   run "$BATS_TEST_TMPDIR/scripts/bump-plugin-version" 1.x.2
   [ "$status" -eq 2 ]
+}
+
+# The hook input for a subagent or tool call in directory $1, as Claude Code
+# sends it (only the fields the hooks read, plus the command for Bash).
+hook_input() {
+  printf '{"session_id":"s","cwd":"%s","hook_event_name":"%s","tool_input":{"command":"%s"}}' "$1" "$2" "${3-}"
+}
+
+@test "SubagentStart in a Nix project: valid JSON with context about the loaded devshell" {
+  HOOK="$REPO_ROOT/hooks/subagent-start.sh"
+  run env PATH="$STUB_DIR:$BARE_PATH" "$HOOK" <<<"$(hook_input /some/worktree SubagentStart)"
+  [ "$status" -eq 0 ]
+  [ "$(jq -r .hookSpecificOutput.hookEventName <<<"$output")" = SubagentStart ]
+  [[ $(jq -r .hookSpecificOutput.additionalContext <<<"$output") == *"nix develop --command"* ]]
+  # It asked about the subagent's directory, not its own.
+  [ "$(cat "$STUB_LOG.print-key")" = "--print-key --dir /some/worktree" ]
+}
+
+@test "SubagentStart outside a Nix project, or without the command: no output" {
+  HOOK="$REPO_ROOT/hooks/subagent-start.sh"
+  NDCE_STUB_NO_PROJECT=1 run env PATH="$STUB_DIR:$BARE_PATH" "$HOOK" <<<"$(hook_input /tmp SubagentStart)"
+  [ "$status" -eq 0 ] && [ -z "$output" ]
+  run env PATH="$BARE_PATH" "$HOOK" <<<"$(hook_input /tmp SubagentStart)"
+  [ "$status" -eq 0 ] && [ -z "$output" ]
+}
+
+@test "PreToolUse: nix develop --command on this devshell gets a reminder, not a denial" {
+  HOOK="$REPO_ROOT/hooks/pre-tool-use.sh"
+  for cmd in 'nix develop -c bats tests' 'nix develop . --command make' 'cd x && nix-shell --run make'; do
+    run env PATH="$STUB_DIR:$BARE_PATH" "$HOOK" <<<"$(hook_input /p PreToolUse "$cmd")"
+    [ "$status" -eq 0 ]
+    [ "$(jq -r .hookSpecificOutput.hookEventName <<<"$output")" = PreToolUse ]
+    [ "$(jq -r '.hookSpecificOutput.permissionDecision // "none"' <<<"$output")" = none ]
+    [[ $(jq -r .hookSpecificOutput.additionalContext <<<"$output") == *"Run the tool directly"* ]]
+  done
+}
+
+@test "PreToolUse: other commands, other flakes, or no project: no output" {
+  HOOK="$REPO_ROOT/hooks/pre-tool-use.sh"
+  for cmd in 'make test' 'nix develop' 'nix develop github:o/r -c x' 'nix develop .#other -c x'; do
+    run env PATH="$STUB_DIR:$BARE_PATH" "$HOOK" <<<"$(hook_input /p PreToolUse "$cmd")"
+    [ "$status" -eq 0 ] && [ -z "$output" ]
+  done
+  NDCE_STUB_NO_PROJECT=1 run env PATH="$STUB_DIR:$BARE_PATH" "$HOOK" <<<"$(hook_input /p PreToolUse 'nix develop -c x')"
+  [ "$status" -eq 0 ] && [ -z "$output" ]
+}
+
+@test "hooks.json registers every hook script, and each one exists" {
+  for f in "$REPO_ROOT"/hooks/*.sh; do
+    grep -qF "/hooks/${f##*/}\"" "$REPO_ROOT/hooks/hooks.json"
+  done
+  jq -e '.hooks.SessionStart and .hooks.SubagentStart and (.hooks.PreToolUse[0].matcher == "Bash")' "$REPO_ROOT/hooks/hooks.json"
 }

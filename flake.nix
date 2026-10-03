@@ -60,6 +60,7 @@
             coreutils
             git
             gnugrep
+            jq
             util-linux
           ];
         in
@@ -86,7 +87,7 @@
               patchShebangs bin hooks scripts tests
               export HOME=$TMPDIR/home
               mkdir -p "$HOME"
-              export NDCE_TEST_HOOKS_SOURCE=${./.}/hooks
+              export NDCE_TEST_PLUGIN_SOURCE=${./.}
               bats tests/unit.bats tests/hooks.bats
               touch $out
             '';
