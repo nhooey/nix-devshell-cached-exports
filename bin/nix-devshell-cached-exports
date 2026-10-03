@@ -15,12 +15,15 @@ set -euo pipefail
 unset CDPATH
 
 readonly PROG=nix-devshell-cached-exports
-readonly FORMAT_VERSION=ndce-v1
+readonly FORMAT_VERSION=ndce-v2
 readonly IDENT_CHARS=ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_
 readonly LOCK_TIMEOUT=900
 readonly FAILED_TAIL_LINES=50
 # A capture deletes this project's cache files untouched for longer than this.
 readonly PRUNE_DAYS=30
+# The Nix store, where a cache entry's devshell lives.
+store_dir=${NIX_STORE_DIR:-/nix/store}
+store_dir=${store_dir%/}
 
 # The packaged command (package.nix) sets __NDCE_TOOLS_PATH to its pinned
 # tools. They go in front of PATH for this script only; the devshell capture
@@ -142,6 +145,16 @@ if [[ -n $max_wait ]]; then
   ((! refresh)) || usage_error "--max-wait and --refresh cannot be combined"
 fi
 
+# What a flake's capture evaluates: `auto` a copy of only the files the key
+# covers when the .nix files show no sign of reading anything else, `minimal`
+# that copy always, `tree` the project itself (which Nix copies whole into the
+# store for each new state of it).
+flake_source=${NDCE_FLAKE_SOURCE:-auto}
+case $flake_source in
+auto | minimal | tree) ;;
+*) die "NDCE_FLAKE_SOURCE must be auto, minimal or tree: $flake_source" ;;
+esac
+
 if [[ -z $dir ]]; then
   usage_error "--dir needs a path"
 fi
@@ -195,6 +208,10 @@ fi
 
 cd -- "$root"
 
+# The flake source setting joins the key: changing it captures again.
+kind_line=$kind
+[[ $kind != flake ]] || kind_line+=" source=$flake_source"
+
 # ---------------------------------------------------------------------------
 # Key
 
@@ -243,7 +260,7 @@ hash_files() {
   local sums
   sums=$(
     {
-      printf '%s\n%s\n' "$FORMAT_VERSION" "$kind"
+      printf '%s\n%s\n' "$FORMAT_VERSION" "$kind_line"
       if (($#)); then
         printf '%s\0' "$@"
         sha256sum -- "$@"
@@ -264,12 +281,15 @@ hash_files() {
 #   f PATH   a file whose contents join the key
 #   c        a shell.nix project looks up <...> paths: NIX_PATH and the
 #            channels join the key
+#   d PATH   a directory a path literal names (not part of the key: it
+#            tells a flake's capture that a minimal copy is not enough)
+#   s        the flake's own source (`self`) is used as a path (the same)
 #
 # The scan errs towards including too much: a needless file only costs a
 # capture when it changes.
 
 # Bumped whenever the scan changes what it finds, so it scans again.
-readonly DEPS_VERSION=v1
+readonly DEPS_VERSION=v2
 
 # Lock files that *2nix tools read from a project's source.
 readonly -a LOCK_NAMES=(
@@ -285,6 +305,9 @@ LOCK_RE=${LOCK_NAMES[*]//./\\.}
 readonly LOCK_RE="(^|[^A-Za-z0-9._-])(${LOCK_RE// /|})([^A-Za-z0-9._-]|\$)"
 readonly ANGLE_RE='<[A-Za-z][A-Za-z0-9._-]*(/[A-Za-z0-9._+-]+)*>'
 readonly UP_RE='^\.\.(/\.\.)*$' # only .. segments
+# `self` (or `inputs.self`) used as a path: `src = self;`, "${self}",
+# `self + "/x"`, `self.outPath`, `cleanSource self`, `toString self`.
+readonly SELF_RE='(\$\{|[=(]|cleanSource(With)?|toString|fileset\.[A-Za-z]+)[[:space:]]*(inputs\.)?self([[:space:]]*([;})+]|$)|\.outPath)'
 
 # normalize PATH : sets `normal` to the relative PATH without `.` segments or
 # `dir/..` pairs ("." for the root itself).
@@ -318,7 +341,7 @@ normalize() {
 scan_deps() {
   local -a nix_files=() locks=()
   local -A dirs=() named=() found=()
-  local f m d p lock angle=0
+  local f m d p lock angle=0 self_src=0
   deps=()
   for f in ${files[@]+"${files[@]}"}; do
     [[ $f == *.nix ]] && nix_files+=("$f")
@@ -327,6 +350,10 @@ scan_deps() {
 
   # -H -Z: each match is "FILE\0MATCH\n".
   while IFS= read -r -d '' f && IFS= read -r m; do
+    if [[ $m =~ $SELF_RE ]]; then
+      self_src=1
+      continue
+    fi
     if [[ $m == '<'* ]]; then
       angle=1
       continue
@@ -347,7 +374,8 @@ scan_deps() {
       normalize "$d/${m%%[!A-Za-z0-9._-]*}"
       named[$normal]=1
     fi
-  done < <(grep -oHZE -e "$PATH_RE" -e "$LOCK_RE" -e "$ANGLE_RE" -- "${nix_files[@]}" 2>/dev/null)
+  done < <(grep -oHZE -e "$PATH_RE" -e "$LOCK_RE" -e "$ANGLE_RE" -e "$SELF_RE" \
+    -- "${nix_files[@]}" 2>/dev/null)
 
   if ((${#dirs[@]} + ${#named[@]})); then
     if ((in_git)); then
@@ -379,7 +407,11 @@ scan_deps() {
     done
     deps+=("f $p")
   done
+  for p in "${!dirs[@]}"; do
+    [[ $p != *$'\n'* ]] && deps+=("d $p")
+  done
   ((! angle)) || [[ $kind == flake ]] || deps+=(c)
+  ((! self_src)) || deps+=(s)
   if ((${#deps[@]})); then
     mapfile -t deps < <(printf '%s\n' "${deps[@]}" | LC_ALL=C sort)
   fi
@@ -468,12 +500,20 @@ fi
 # ---------------------------------------------------------------------------
 # Fast path: a cache hit is a `cat` (done with builtins: no process to start).
 
+# live HEADER : whether the store path an entry's header names (` store=`,
+# one its PATH needs) still exists. A garbage collection that removed it
+# leaves the entry pointing at nothing, so it counts as missing.
+live() {
+  [[ $1 != *' store='* ]] || [[ -e ${1##* store=} ]]
+}
+
 # print_hit : prints the cache entry for the current key and exits 0, if it
-# exists and is non-empty; returns 1 otherwise.
+# exists, is non-empty, and is live; returns 1 otherwise.
 print_hit() {
   local text=''
   [[ -s $cache_file ]] || return 1
   IFS= read -r -d '' text <"$cache_file" || [[ -n $text ]] || return 1
+  live "${text%%$'\n'*}" || return 1
   printf '%s' "$text"
   # A warning from the capture, shown once: the capture itself may have run
   # detached (--max-wait), where nobody saw its stderr.
@@ -492,9 +532,13 @@ fi
 # Failure handling
 
 tmp_files=()
+tmp_dirs=()
 cleanup() {
   if ((${#tmp_files[@]})); then
     rm -f -- "${tmp_files[@]}"
+  fi
+  if ((${#tmp_dirs[@]})); then
+    rm -rf -- "${tmp_dirs[@]}"
   fi
 }
 trap cleanup EXIT
@@ -507,13 +551,21 @@ new_tmp() { # new_tmp NAME: creates a temp file in the cache dir, sets `tmp`
   tmp_files+=("$tmp")
 }
 
+# print_last_good : prints the last good entry, if there is a live one.
+print_last_good() {
+  local last_good=$cache_dir/last-good header=''
+  [[ -s $last_good ]] || return 1
+  IFS= read -r header <"$last_good" || [[ -n $header ]] || return 1
+  live "$header" || return 1
+  cat -- "$last_good"
+}
+
 # fail DETAILS_FILE | fail -m MESSAGE | fail -r MESSAGE : print the last good
 # environment with one warning line and exit 0; without one, print the details
 # on stderr (or, with -r, one line ending in MESSAGE) and exit 1 with nothing
 # on stdout.
 fail() {
-  local last_good=$cache_dir/last-good
-  if [[ -s $last_good ]] && cat -- "$last_good"; then
+  if print_last_good; then
     printf '%s: devshell capture failed for %s; using the last good environment. Fix it, then run: %s --refresh\n' \
       "$PROG" "$root" "$PROG" >&2
     exit 0
@@ -550,8 +602,7 @@ fi
 # still_capturing : print the last good environment, if any, with one line
 # saying a capture is still running, and exit 0.
 still_capturing() {
-  local last_good=$cache_dir/last-good
-  if [[ -s $last_good ]] && cat -- "$last_good"; then
+  if print_last_good; then
     printf '%s: still capturing the devshell for %s; using the last good environment until it finishes\n' \
       "$PROG" "$root" >&2
   else
@@ -572,7 +623,7 @@ if [[ -n $max_wait ]]; then
     [[ ! -e $cache_dir/$key.failed ]] || fail_remembered
     last_good_now=$(readlink -- "$cache_dir/last-good" 2>/dev/null) || last_good_now=
     if [[ -n $last_good_now && $last_good_now != "$last_good_before" ]]; then
-      cat -- "$cache_dir/last-good" && exit 0
+      print_last_good && exit 0
     fi
   done
   still_capturing
@@ -582,6 +633,9 @@ fi
 # Lock, then re-check: another caller may have captured while we waited.
 
 mkdir -p -- "$cache_dir" || die "cannot create $cache_dir"
+# Only the user reads the cache: the environments in it can hold paths and
+# values they would not share.
+chmod 700 -- "$cache_dir" 2>/dev/null || true
 exec {lock_fd}>>"$cache_dir/.lock" || die "cannot open $cache_dir/.lock"
 if ! flock -w "$LOCK_TIMEOUT" "$lock_fd"; then
   fail -m "timed out after ${LOCK_TIMEOUT}s waiting for another capture of $root"
@@ -634,8 +688,13 @@ words NDCE_PASSTHROUGH HOME USER LOGNAME PATH TERM LANG 'LC_*' TZ NIX_PATH \
   SSH_AUTH_SOCK GIT_SSH GIT_SSH_COMMAND 'XDG_*' TMPDIR
 passthrough=("${list[@]}")
 words NDCE_EXCLUDE TMPDIR TMP TEMP TEMPDIR NIX_BUILD_TOP SHLVL PWD OLDPWD _ \
-  __CF_USER_TEXT_ENCODING 'BASH_*' BASHOPTS SHELLOPTS
+  __CF_USER_TEXT_ENCODING 'BASH_*' BASHOPTS SHELLOPTS SHELL
 exclude=("${list[@]}")
+# Names that look like secrets, as shell patterns matched without regard to
+# case: the cache is a file on disk, so their values are left out of it.
+words NDCE_SECRET_VARS '*TOKEN*' '*SECRET*' '*PASSWORD*' '*PASSWD*' \
+  '*PASSPHRASE*' '*CREDENTIAL*' '*API_KEY*' '*ACCESS_KEY*' '*PRIVATE_KEY*'
+secret_vars=("${list[@]}")
 words NDCE_PREPEND_VARS PATH XDG_DATA_DIRS
 prepend_vars=()
 for v in "${list[@]}"; do
@@ -717,11 +776,6 @@ env -i -- ${base_args[@]+"${base_args[@]}"} "$env_bin" -0 >"$baseline_file" {loc
 # relying on a shell being on the devshell's PATH; nix-shell --run is bash.
 SENTINEL=__NDCE_ENV_BEGIN__
 entry_script="printf '%s\\0' $SENTINEL; exec env -0"
-if [[ $kind == flake ]]; then
-  entry=("$entry_bin" develop "$root" --command "$BASH" -c "$entry_script")
-else
-  entry=("$entry_bin" "$entry_file" --run "$entry_script")
-fi
 
 # parse_env0 FILE ARRAY [SENTINEL] : reads `env -0` output into the
 # associative ARRAY. With SENTINEL, records up to and including the one that
@@ -758,11 +812,64 @@ non_lock_hash
 pre_sig=$hash
 pre_key=$key
 
-capture_status=0
-# The lock fd is closed for the capture: anything the shell hook leaves
-# running in the background would otherwise hold the lock after we exit.
-env -i -- ${base_args[@]+"${base_args[@]}"} "${entry[@]}" \
-  </dev/null >"$out_file" 2>"$err_file" {lock_fd}>&- || capture_status=$?
+# A flake's source: `nix develop` on the project copies all of it into the
+# store, once for each state of it that the store has not seen. Where the
+# .nix files show no sign of reading anything but themselves and the files
+# the key covers, a copy of just those is evaluated instead (see
+# NDCE_FLAKE_SOURCE). Without a flake.lock the project itself is used, so
+# that nix writes the new lock file there.
+src_dir=
+if [[ $kind == flake && $flake_source != tree ]]; then
+  use_copy=0
+  for f in ${files[@]+"${files[@]}"}; do
+    [[ $f != flake.lock ]] || use_copy=1
+  done
+  copy=()
+  for line in ${deps[@]+"${deps[@]}"}; do
+    case $line in
+    'f ../'*) [[ $flake_source == minimal ]] || use_copy=0 ;;
+    'f '*) copy+=("${line#f }") ;;
+    'd '* | s) [[ $flake_source == minimal ]] || use_copy=0 ;;
+    esac
+  done
+  if ((use_copy)); then
+    src_dir=$(mktemp -d "$cache_dir/.src.XXXXXX") || die "cannot create a directory in $cache_dir"
+    tmp_dirs+=("$src_dir")
+    if ! cp --parents -- "${files[@]}" ${copy[@]+"${copy[@]}"} "$src_dir/" 2>/dev/null; then
+      src_dir=
+    fi
+  fi
+fi
+
+# The capture's profile keeps the devshell from garbage collection; it is
+# named for the key the capture starts from.
+profile=$cache_dir/$pre_key.profile
+
+# capture SOURCE : runs the entry command, setting `capture_status`. The lock
+# fd is closed for it: anything the shell hook leaves running in the
+# background would otherwise hold the lock after we exit.
+capture() {
+  if [[ $kind == flake ]]; then
+    rm -f -- "$profile" "$profile"-*-link
+    entry=("$entry_bin" develop "$1" --profile "$profile" --command "$BASH" -c "$entry_script")
+  else
+    entry=("$entry_bin" "$entry_file" --run "$entry_script")
+  fi
+  capture_status=0
+  env -i -- ${base_args[@]+"${base_args[@]}"} "${entry[@]}" \
+    </dev/null >"$out_file" 2>"$err_file" {lock_fd}>&- || capture_status=$?
+}
+
+if [[ -n $src_dir ]]; then
+  capture "path:$src_dir"
+  # The copy may lack a file the scan could not see: try the project itself.
+  if ((capture_status != 0)) && [[ $flake_source == auto ]]; then
+    src_dir=
+    capture "$root"
+  fi
+else
+  capture "$root"
+fi
 
 record_failure() { # record_failure DETAILS_FILE
   local marker=$cache_dir/$key.failed
@@ -816,6 +923,16 @@ quote() {
   quoted="'${1//\'/"$sq"}'"
 }
 
+# is_secret NAME : whether NAME matches one of the secret patterns.
+is_secret() {
+  local upper=${1^^} p
+  for p in ${secret_vars[@]+"${secret_vars[@]}"}; do
+    # shellcheck disable=SC2053 # the pattern is a glob on purpose
+    [[ $upper == ${p^^} ]] && return 0
+  done
+  return 1
+}
+
 is_excluded() {
   matches_any "$1" ${exclude[@]+"${exclude[@]}"} && return 0
   if [[ $1 == SHELL ]]; then
@@ -861,11 +978,17 @@ export __NDCE_ADDED_@VAR@="${__ndce_a}"
 # Everything below goes after the header, filled in once the key is final.
 body=
 prepend_body=
+secrets=
+path_added=
 mapfile -t names < <(printf '%s\n' "${!dev_env[@]}" | LC_ALL=C sort)
 for name in "${names[@]}"; do
   value=${dev_env[$name]}
   is_excluded "$name" "$value" && continue
   if [[ -n ${base_env[$name]+set} && ${base_env[$name]} == "$value" ]]; then
+    continue
+  fi
+  if is_secret "$name"; then
+    secrets+=" $name"
     continue
   fi
 
@@ -889,20 +1012,29 @@ for name in "${names[@]}"; do
         e=${rest%%:*}
         rest=${rest#*:}
         [[ -n $e && -z ${seen[$e]+set} ]] || continue
-        # The caller's own entries, repeated by the devshell, are not added.
-        [[ ":$base_value:" == *":$e:"* ]] && continue
+        # nix develop's placeholder for an unset PATH.
+        [[ $e != /path-not-set ]] || continue
+        # The caller's own entries, repeated by the devshell, are not added;
+        # store paths are, though: a caller already inside this devshell
+        # (started from `nix develop`, say) has them, and one that is not
+        # needs them.
+        [[ $e != "$store_dir"/* && ":$base_value:" == *":$e:"* ]] && continue
         seen[$e]=1
         clean+=":$e"
       done
       unset seen
       clean=${clean#:}
       [[ -n $clean ]] || continue
+      [[ $name != PATH ]] || path_added=$clean
       quote "$clean"
       block=${PREPEND_TEMPLATE//@VAR@/$name}
       prepend_body+=${block//@ADDED@/"$quoted"}
       continue
     fi
     # Replaced rather than prepended: an absolute value like any other.
+    strip_entries "$value" /path-not-set
+    value=$stripped
+    [[ $name != PATH ]] || path_added=$value
     quote "$value"
     body+="export $name=$quoted
 unset __NDCE_ADDED_$name
@@ -917,6 +1049,33 @@ done
 if [[ -n $prepend_body ]]; then
   prepend_body+="unset __ndce_a __ndce_o __ndce_v __ndce_e __ndce_r __ndce_g __ndce_i __ndce_u
 "
+fi
+if [[ -n $secrets ]]; then
+  warning+="$PROG: in $root, left out of the cache as they look like secrets:$secrets."
+  warning+=" Load them another way, or change NDCE_SECRET_VARS."$'\n'
+fi
+
+# The store path a cache hit checks is still there: the first one the PATH
+# gains. A garbage collection that removes it turns the entry into a miss.
+witness=
+rest=$path_added:
+while [[ -n $rest ]]; do
+  e=${rest%%:*}
+  rest=${rest#*:}
+  if [[ $e == "$store_dir"/?* ]]; then
+    e=${e#"$store_dir"/}
+    e=$store_dir/${e%%/*}
+    if [[ -e $e && $e != *[[:space:]]* ]]; then
+      witness=$e
+      break
+    fi
+  fi
+done
+
+# A capture of the copy that updated its flake.lock updates the project's,
+# as `nix develop` on the project would have.
+if [[ -n $src_dir && -f $src_dir/flake.lock ]] && ! cmp -s -- "$src_dir/flake.lock" flake.lock; then
+  cp -- "$src_dir/flake.lock" flake.lock || fail -m "could not update $root/flake.lock"
 fi
 
 # ---------------------------------------------------------------------------
@@ -933,7 +1092,7 @@ if [[ $hash != "$pre_sig" ]]; then
 fi
 
 header_root=${root//$'\n'/\\n}
-output="# $PROG v1 root=$header_root key=$key
+output="# $PROG v2 root=$header_root key=$key${witness:+ store=$witness}
 $body$prepend_body"
 
 new_tmp "$key"
@@ -951,12 +1110,22 @@ ln -sf -- "$key.sh" "$tmp"
 mv -f -- "$tmp" "$cache_dir/last-good"
 rm -f -- "$cache_dir/$key.failed" "$cache_dir/$pre_key.failed"
 
-# Prune: entries for old versions of the .nix files, their records and
-# failure markers, and temp files a killed call left behind. Only a capture
+# A capture stored under a new key (it rewrote flake.lock) roots the
+# devshell under that key too, so pruning keeps the root while the entry
+# lives. Best-effort: without it, a hit notices a collected devshell.
+if [[ $key != "$pre_key" && -L $profile ]]; then
+  if "${entry_bin%/*}/nix-store" --add-root "$cache_dir/$key.profile" \
+    --realise "$(readlink -f -- "$profile")" >/dev/null 2>&1; then
+    rm -f -- "$profile" "$profile"-*-link
+  fi
+fi
+
+# Prune: entries for old versions of the .nix files, their records, failure
+# markers and GC roots, and temp files a killed call left behind. Only a capture
 # prunes, so a cache hit costs nothing; an old entry pruned while still in
 # use (another branch, say) costs one capture.
-find "$cache_dir" -mindepth 1 -maxdepth 1 -type f -mtime +"$PRUNE_DAYS" \
-  ! -name .lock ! -name "$key.*" ! -name "${deps_file##*/}" \
+find "$cache_dir" -mindepth 1 -maxdepth 1 \( -type f -o -type l \) -mtime +"$PRUNE_DAYS" \
+  ! -name .lock ! -name last-good ! -name "$key.*" ! -name "${deps_file##*/}" \
   -delete 2>/dev/null || true
 
 printf '%s' "$output"

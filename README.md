@@ -6,7 +6,7 @@ devshell:
 
 ```console
 $ cd ~/src/project && nix-devshell-cached-exports
-# nix-devshell-cached-exports v1 root=/home/user/src/project key=8c1e0f3b9a…
+# nix-devshell-cached-exports v2 root=/home/user/src/project key=8c1e0f3b9a… store=/nix/store/…-hello-2.12.3
 export CC='clang'
 export FOO='multi
 line '\''q'\'' $x'
@@ -32,6 +32,9 @@ once (`nix develop` or `nix-shell`), including its shell hooks, and caches the
 diff; every call after that is a `cat` of a few kilobytes, about 25–30 ms,
 against 1–6 s for `nix develop --command …`, depending on the project. Loading is a `source`, not a
 re-entry: shell hooks run once per change to the devshell, not once per load.
+A hook that has to run for every command, one that loads secrets fresh or
+syncs files, say, does not fit this model. Nor does timing each command: the
+command only loads an environment.
 
 It hooks nothing into anyone's shell, needs no per-directory allow step, and
 re-runs no shell hooks on a load. That is the difference from direnv with
@@ -62,6 +65,10 @@ the new environment. If
 stderr saying so and how to install it, and otherwise does nothing; the
 session still starts normally. The plugin refers to the command by name
 only — no store paths, no vendored copy, no `nix run`.
+
+Only `SessionStart` adds that line, and `/reload-plugins` does not run it: a
+session that installs or enables the plugin partway through gets the
+devshell after a restart (`claude --resume` keeps the conversation).
 
 ### `.envrc`
 
@@ -129,7 +136,8 @@ nix-devshell-cached-exports -h | --help
 ${XDG_CACHE_HOME:-$HOME/.cache}/nix-devshell-cached-exports/<rootid>/
   <key>.sh        # a good capture (the exact text printed)
   <key>.failed    # failure marker: tail of nix's stderr
-  <hash>.v1.deps  # other files the .nix files with this hash depend on
+  <key>.profile   # a flake's GC root: keeps its devshell in the store
+  <hash>.v2.deps  # other files the .nix files with this hash depend on
   last-good       # symlink -> <key>.sh of the most recent good capture
   .lock           # flock target
 ```
@@ -137,15 +145,15 @@ ${XDG_CACHE_HOME:-$HOME/.cache}/nix-devshell-cached-exports/<rootid>/
 `<rootid>` is the first 16 hex characters of the sha256 of the project
 root's absolute path, so a git worktree gets its own cache directory even
 though it shares the main checkout's history. `<key>` is the first 32 hex
-characters of a sha256 over a format-version tag, the project kind, the
-sorted names, and the sha256 of each file that defines the devshell (`flake.nix`,
+characters of a sha256 over a format-version tag, the project kind (with
+`NDCE_FLAKE_SOURCE`, for a flake), the sorted names, and the sha256 of each file that defines the devshell (`flake.nix`,
 `flake.lock`, every tracked `*.nix`, and any path-input sub-flake's
 `flake.lock`). A `shell.nix` or `default.nix` project also counts untracked
 `*.nix` files, which nix-shell reads and a flake cannot. Editing any of those
 files produces a new key and a fresh capture on the next call.
 
 When those files change, a rough scan of the `*.nix` files finds what else
-the devshell may read, records it in `<hash>.v1.deps`, and folds it into the
+the devshell may read, records it in `<hash>.v2.deps`, and folds it into the
 key:
 
 - a file named by a relative path literal, such as
@@ -161,18 +169,50 @@ key:
   and the targets of the channel profiles, so a channel update recaptures.
 
 The scan errs towards including too much: an extra file only costs a capture
-when it changes. A cache hit never scans: it reads `<hash>.v1.deps`, which is
+when it changes. A cache hit never scans: it reads `<hash>.v2.deps`, which is
 empty for most projects, and hashes the files it lists. Dependencies the scan
 cannot see, such as an unpinned `fetchTarball` or a path built from strings,
 still need `--refresh`.
 
 Each successful capture also deletes the project's cache files that have not
 been written for 30 days, other than the new entry, `last-good` and `.lock`:
-entries for old versions of the `.nix` files, their records and failure
-markers, and temp files a killed call left behind. A cache hit does not
+entries for old versions of the `.nix` files, their records, failure markers
+and GC roots, and temp files a killed call left behind. A cache hit does not
 refresh an entry's age, so an old entry still in use, such as another
 branch's, is pruned and costs one capture the next time. Directories of
 projects that no longer exist are left in place; delete them by hand.
+
+### Store copies, GC roots and secrets
+
+`nix develop` on a flake in a git checkout copies every tracked file into
+the store, once for each state of the tree it has not seen; for a large
+repository that adds up. So when the scan finds the `.nix` files reading
+nothing but themselves, the files the key covers and the files it found, a
+flake with a `flake.lock` is captured from a copy of just those files
+(`nix develop path:<copy>`), still from the project root, so shell hooks see
+the project as `$PWD`. A path literal naming a directory (`src = ./.;`), or
+`self` used as a path (`src = self;`, `"${self}"`), means the devshell may
+need more, so the capture uses the project itself; so does a copy that fails
+to evaluate. If the copy's capture updates `flake.lock`, the project's is
+updated to match, as `nix develop` would. `NDCE_FLAKE_SOURCE` overrides the
+choice: `minimal` always uses the copy, for a flake whose devshell needs none
+of what its packages read; `tree` always uses the project. Per project, set
+it in `.claude/settings.json` (`"env": {"NDCE_FLAKE_SOURCE": "minimal"}`) or
+in `.envrc`.
+
+A flake's capture keeps its devshell as a GC root, `<key>.profile`, so a
+garbage collection leaves a cached environment's store paths in place; the
+root goes when pruning removes its entry. A `shell.nix` capture has no root.
+Either way an entry's header names a store path its `PATH` needs, and a load
+that finds it gone captures again instead of loading a `PATH` that points at
+nothing.
+
+The cache directory is readable only by its owner, but it is still a file on
+disk. Variables whose names look like secrets (matching `*TOKEN*`,
+`*SECRET*`, `*PASSWORD*`, `*PASSWD*`, `*PASSPHRASE*`, `*CREDENTIAL*`,
+`*API_KEY*`, `*ACCESS_KEY*` or `*PRIVATE_KEY*`, in any case) are left out of
+it, with a warning naming them; load those another way, or set
+`NDCE_SECRET_VARS` to change the patterns (empty keeps everything).
 
 ### Failure fallback
 
@@ -217,10 +257,16 @@ drops, each space-separated with `*` as a prefix wildcard:
 - `NDCE_EXCLUDE` overrides the variables dropped from the diff regardless of
   whether the devshell changed them (default: `TMPDIR TMP TEMP TEMPDIR
   NIX_BUILD_TOP SHLVL PWD OLDPWD _ __CF_USER_TEXT_ENCODING BASH_* BASHOPTS
-  SHELLOPTS`, plus `SHELL` when it is `/sbin/nologin` or `/usr/bin/false`).
+  SHELLOPTS SHELL`: a devshell's `SHELL` would replace the caller's own; plus
+  `SHELL`, even when overridden, when it is `/sbin/nologin` or
+  `/usr/bin/false`).
 - `NDCE_PREPEND_VARS` overrides which colon-list variables are emitted as
   prepend-to-caller rather than as an absolute value (default: `PATH
-  XDG_DATA_DIRS`).
+  XDG_DATA_DIRS`). An entry the caller already has is not counted as added,
+  unless it is in the Nix store: a caller started inside the devshell (from
+  `nix develop`, say) has those already, and the cache is for every caller.
+
+`NDCE_SECRET_VARS` and `NDCE_FLAKE_SOURCE` are described above.
 
 ## Measured
 

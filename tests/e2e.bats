@@ -104,6 +104,32 @@ load_fixture() {
   [ "$(wc -l <"$proj/marker" | tr -d ' ')" -eq 2 ]
 }
 
+# 2 captures: the first writes flake.lock (from the project), the second
+# runs from a copy of the .nix files and the lock.
+@test "[e2e] a locked flake captures from a copy, and its devshell has a GC root" {
+  load_fixture flake-hook
+  cd "$proj"
+  run ndce
+  [ "$status" -eq 0 ]
+  git add -A && git commit -q -m lock
+
+  echo "# a no-op comment" >>flake.nix
+  git add -A && git commit -q -m edit
+  run ndce
+  [ "$status" -eq 0 ]
+  eval "$output"
+  # The shell hook ran in the project, not in the copy.
+  [ "$FIXTURE_HOOK_PWD" = "$proj" ]
+
+  k=$(ndce --print-key)
+  dir=$(dirname "$(ndce --print-cache-path)")
+  [ -L "$dir/$k.profile" ]
+  env_path=$(readlink -f "$dir/$k.profile")
+  [[ $env_path == /nix/store/* ]]
+  nix-store --query --roots "$env_path" | grep -qF "$dir/$k.profile"
+  [ -z "$(find "$dir" -name '.src.*')" ]
+}
+
 @test "[e2e] git worktree gets its own root, cache dir, and \$PWD-derived value" {
   load_fixture flake-hook
   cd "$proj"

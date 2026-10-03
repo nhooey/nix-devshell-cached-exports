@@ -3,7 +3,14 @@
 # (tests/unit.bats). Supports exactly one invocation shape, the one
 # nix-devshell-cached-exports uses to capture a flake devshell:
 #
-#   nix develop <root> --command <program> [<arg>...]
+#   nix develop <ref> --profile <path> --command <program> [<arg>...]
+#
+# <ref> is the project root, or path:<dir> for a copy of its .nix files;
+# either way the stub runs from the project root (the current directory),
+# sourcing its stub-env.sh. A project with a NEEDS_TREE file fails for a
+# path: copy, as a flake that reads files the copy lacks would. The profile
+# becomes a symlink to the copy (or root), standing in for the env path.
+# The log records the ref as given.
 #
 # See CONTRACT.md, "Test stubs", for the required behaviour.
 set -euo pipefail
@@ -13,10 +20,17 @@ usage_error() {
   exit 64
 }
 
-[ "$#" -ge 4 ] || usage_error "$@"
+[ "$#" -ge 6 ] || usage_error "$@"
 [ "$1" = "develop" ] || usage_error "$@"
-root=$2
-[ "$3" = "--command" ] || usage_error "$@"
+ref=$2
+[ "$3" = "--profile" ] || usage_error "$@"
+profile=$4
+[ "$5" = "--command" ] || usage_error "$@"
+root=$PWD
+case $ref in
+path:*) src=${ref#path:} ;;
+*) src=$ref ;;
+esac
 
 if [ -n "${STUB_NIX_LOG:-}" ]; then
   printf 'nix %s\n' "$*" >>"$STUB_NIX_LOG"
@@ -30,10 +44,20 @@ if [ -e "$root/BROKEN" ]; then
   echo "stub-nix: simulated devshell failure for $root" >&2
   exit 1
 fi
+if [ "$src" != "$ref" ] && [ -e "$root/NEEDS_TREE" ]; then
+  echo "stub-nix: path '$src/data' does not exist" >&2
+  exit 1
+fi
 
-(
-  cd "$root"
-  # shellcheck source=/dev/null
-  source "$root/stub-env.sh"
-  exec "${@:4}"
-)
+# A project with a LOCK_UPDATE file has its flake.lock updated, as nix does
+# when an input is added.
+if [ -e "$root/LOCK_UPDATE" ]; then
+  echo '{"updated": true}' >"$src/flake.lock"
+fi
+
+ln -sfn "$src" "$profile-1-link"
+ln -sfn "${profile##*/}-1-link" "$profile"
+
+# shellcheck source=/dev/null
+source "$root/stub-env.sh"
+exec "${@:6}"

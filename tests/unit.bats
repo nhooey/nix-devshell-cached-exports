@@ -43,6 +43,9 @@ setup() {
   export GIT_COMMITTER_NAME=test GIT_COMMITTER_EMAIL=test@example.com
 
   unset TMPDIR TMP TEMP TEMPDIR
+  # A load in the shell running the tests (this repo's own devshell, say)
+  # would make the first load here take its entries back out of PATH.
+  unset "${!__NDCE_ADDED_@}"
 }
 
 ndce() {
@@ -691,8 +694,8 @@ key() {
   run ndce --print-cache-path
   dir=${output%/*}
   # The key of a project without dependencies is the .nix files' own hash.
-  [ -e "$dir/$k1.v1.deps" ]
-  [ ! -s "$dir/$k1.v1.deps" ]
+  [ -e "$dir/$k1.v2.deps" ]
+  [ ! -s "$dir/$k1.v2.deps" ]
 }
 
 @test "a devshell launcher named after a command on PATH: warned at capture and once after" {
@@ -750,7 +753,7 @@ export FIXTURE_MINIMAL=1"
   printf 'x' >"$dir/fedcba9876543210fedcba9876543210.sh"
   touch -d '40 days ago' "$dir/0123456789abcdef0123456789abcdef.sh" \
     "$dir/0123456789abcdef0123456789abcdef.failed" "$dir/.$k.sh.AbCdEf" \
-    "$dir/$k.sh" "$dir/$k.v1.deps" "$dir/.lock"
+    "$dir/$k.sh" "$dir/$k.v2.deps" "$dir/.lock"
 
   run ndce --refresh
   [ "$status" -eq 0 ]
@@ -758,8 +761,167 @@ export FIXTURE_MINIMAL=1"
   [ ! -e "$dir/0123456789abcdef0123456789abcdef.failed" ]
   [ ! -e "$dir/.$k.sh.AbCdEf" ]
   [ -e "$dir/fedcba9876543210fedcba9876543210.sh" ]
-  [ -e "$dir/$k.v1.deps" ]
+  [ -e "$dir/$k.v2.deps" ]
   [ -e "$dir/.lock" ]
   [ -s "$cache_file" ]
   [ -L "$dir/last-good" ]
+}
+
+# A fake store, with one devshell path in it, for the PATH and GC tests.
+fake_store() {
+  export NIX_STORE_DIR=$BATS_TEST_TMPDIR/store
+  tool=$NIX_STORE_DIR/aaaa-tool
+  mkdir -p "$tool/bin"
+}
+
+@test "store entries the caller already has (inside the devshell) are still added; the placeholder is not" {
+  load_fixture flake-minimal
+  cd "$proj"
+  fake_store
+  set_stub_env "export PATH=\"$tool/bin:/path-not-set:\$PATH\""
+  export PATH="$tool/bin:$PATH"
+
+  run ndce
+  [ "$status" -eq 0 ]
+  [[ $output == *"__ndce_a='$tool/bin'"* ]]
+  [[ $output != *path-not-set* ]]
+}
+
+@test "an entry whose devshell was garbage-collected is captured again" {
+  load_fixture flake-minimal
+  cd "$proj"
+  fake_store
+  set_stub_env "export PATH=\"$tool/bin:\$PATH\""
+
+  run ndce
+  [ "$status" -eq 0 ]
+  [[ ${lines[0]} == *" store=$tool" ]]
+  run ndce
+  [ "$(nix_log_lines)" -eq 1 ]
+
+  rm -rf "$tool"
+  run ndce
+  [ "$status" -eq 0 ]
+  [ "$(nix_log_lines)" -eq 2 ]
+}
+
+@test "a broken flake does not fall back to a last good entry that was garbage-collected" {
+  load_fixture flake-minimal
+  cd "$proj"
+  fake_store
+  set_stub_env "export PATH=\"$tool/bin:\$PATH\""
+  run ndce
+  [ "$status" -eq 0 ]
+
+  rm -rf "$tool"
+  touch BROKEN
+  echo "# edit" >>flake.nix
+  git add -A && git commit -q -m broken
+  run ndce
+  [ "$status" -eq 1 ]
+  [[ $output != *"export "* ]]
+}
+
+@test "secret-looking variables and SHELL stay out of the cache, with a warning" {
+  load_fixture flake-minimal
+  cd "$proj"
+  set_stub_env 'export HF_TOKEN=tok-value MY_Password=pw-value SHELL=/bin/devshell-bash KEEP_ME=1'
+
+  run --separate-stderr ndce
+  [ "$status" -eq 0 ]
+  [[ $output == *"KEEP_ME"* ]]
+  [[ $output != *tok-value* && $output != *pw-value* && $output != *SHELL=* ]]
+  [[ $stderr == *"look like secrets: HF_TOKEN MY_Password."* ]]
+  run ndce --print-cache-path
+  ! grep -q -e tok-value -e pw-value "$output"
+  [ "$(stat -c %a "${output%/*}")" = 700 ]
+}
+
+@test "NDCE_SECRET_VARS set empty caches every variable" {
+  load_fixture flake-minimal
+  cd "$proj"
+  set_stub_env 'export HF_TOKEN=tok-value'
+  NDCE_SECRET_VARS= run --separate-stderr ndce
+  [ "$status" -eq 0 ]
+  [[ $output == *"HF_TOKEN='tok-value'"* ]]
+  [ -z "$stderr" ]
+}
+
+# flake-minimal with a flake.lock, so that a capture may use a copy.
+locked_flake() {
+  load_fixture flake-minimal
+  cd "$proj"
+  echo '{}' >flake.lock
+  git add -A && git commit -q -m lock
+}
+
+@test "source: a flake that reads nothing else is captured from a copy of its files, with a GC root" {
+  locked_flake
+  run ndce
+  [ "$status" -eq 0 ]
+  [ "$(nix_log_lines)" -eq 1 ]
+  grep -q '^nix develop path:' "$STUB_NIX_LOG"
+  k=$(key)
+  run ndce --print-cache-path
+  [ -L "${output%/*}/$k.profile" ]
+  # The copy is gone once the capture is done.
+  [ -z "$(find "${output%/*}" -name '.src.*')" ]
+}
+
+@test "source: a directory reference, self as a path, or NDCE_FLAKE_SOURCE=tree uses the project" {
+  locked_flake
+  sed -i 's|FIXTURE_MINIMAL = "1";|FIXTURE_MINIMAL = "1"; src = ./.;|' flake.nix
+  git add -A && git commit -q -m dir
+  run ndce
+  [ "$status" -eq 0 ]
+  grep -q "^nix develop $proj " "$STUB_NIX_LOG"
+
+  sed -i 's|src = ./.;|src = inputs.self;|' flake.nix
+  git add -A && git commit -q -m self
+  : >"$STUB_NIX_LOG"
+  run ndce
+  [ "$status" -eq 0 ]
+  grep -q "^nix develop $proj " "$STUB_NIX_LOG"
+
+  sed -i 's|src = inputs.self;||' flake.nix
+  git add -A && git commit -q -m plain
+  : >"$STUB_NIX_LOG"
+  NDCE_FLAKE_SOURCE=tree run ndce
+  [ "$status" -eq 0 ]
+  grep -q "^nix develop $proj " "$STUB_NIX_LOG"
+
+  NDCE_FLAKE_SOURCE=bogus run ndce
+  [ "$status" -eq 1 ]
+}
+
+@test "source: NDCE_FLAKE_SOURCE=minimal uses the copy despite a directory reference" {
+  locked_flake
+  sed -i 's|FIXTURE_MINIMAL = "1";|FIXTURE_MINIMAL = "1"; src = ./.;|' flake.nix
+  git add -A && git commit -q -m dir
+  NDCE_FLAKE_SOURCE=minimal run ndce
+  [ "$status" -eq 0 ]
+  grep -q '^nix develop path:' "$STUB_NIX_LOG"
+}
+
+@test "source: a copy that fails to evaluate is retried on the project" {
+  locked_flake
+  touch NEEDS_TREE
+  git add -A && git commit -q -m needs-tree
+  run ndce
+  [ "$status" -eq 0 ]
+  [ "$(nix_log_lines)" -eq 2 ]
+  grep -q '^nix develop path:' "$STUB_NIX_LOG"
+  grep -q "^nix develop $proj " "$STUB_NIX_LOG"
+}
+
+@test "source: a lock file the copy's capture updated is written back to the project" {
+  locked_flake
+  touch LOCK_UPDATE
+  git add -A && git commit -q -m lock-update
+  run ndce
+  [ "$status" -eq 0 ]
+  [ "$(cat flake.lock)" = '{"updated": true}' ]
+  # Stored under the key of the updated lock file: the next call is a hit.
+  run ndce
+  [ "$(nix_log_lines)" -eq 1 ]
 }
