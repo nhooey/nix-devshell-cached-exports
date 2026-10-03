@@ -8,6 +8,7 @@
     {
       "name": "nix-devshell-cached-exports",
       "source": "./",
+      "version": "0.2.0",
       "description": "Load a Nix devshell's cached exports into every Bash command via SessionStart"
     }
   ]

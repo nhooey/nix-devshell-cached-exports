@@ -56,6 +56,13 @@ This repository is both a marketplace and a plugin. From inside a session:
 /plugin install nix-devshell-cached-exports@nix-devshell-cached-exports
 ```
 
+To update it, run `/plugin marketplace update nix-devshell-cached-exports`,
+then `/plugin update nix-devshell-cached-exports@nix-devshell-cached-exports`,
+and restart Claude Code. Claude Code fetches the plugin again only when the
+version in `.claude-plugin/plugin.json` changes, so every change to `hooks/`
+comes with a bump there and in `marketplace.json` (`tests/hooks.bats` checks
+both).
+
 Its `SessionStart` hook appends
 `command -v nix-devshell-cached-exports >/dev/null 2>&1 && eval "$(nix-devshell-cached-exports --max-wait 10 </dev/null)"` to
 `$CLAUDE_ENV_FILE`, the file Claude Code prepends to every Bash tool command,

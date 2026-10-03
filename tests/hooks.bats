@@ -113,3 +113,22 @@ cd() { builtin cd "$@" || return; command -v nix-devshell-cached-exports >/dev/n
   [ "${#lines[@]}" -eq 0 ]
   [ ! -e "$ENV_FILE" ]
 }
+
+# Claude Code fetches a plugin again only when its version changes, so a
+# hook change without a bump never reaches anyone who already installed it.
+@test "plugin.json and marketplace.json give the plugin the same version" {
+  v=$(grep -oE '"version": *"[^"]*"' "$REPO_ROOT/.claude-plugin/plugin.json")
+  [ -n "$v" ]
+  grep -qF -- "$v" "$REPO_ROOT/.claude-plugin/marketplace.json"
+}
+
+@test "every hook change comes with a plugin version bump" {
+  git -C "$REPO_ROOT" rev-parse --verify -q HEAD >/dev/null 2>&1 || skip "needs the git history"
+  # A bump not yet committed covers every change before it.
+  if git -C "$REPO_ROOT" diff HEAD -- .claude-plugin/plugin.json | grep -qE '^\+.*"version"'; then
+    return
+  fi
+  git -C "$REPO_ROOT" diff --quiet HEAD -- hooks
+  bump=$(git -C "$REPO_ROOT" log -1 --format=%H -G'"version"' -- .claude-plugin/plugin.json)
+  [ -z "$(git -C "$REPO_ROOT" log --format=%h "$bump..HEAD" -- hooks)" ]
+}
