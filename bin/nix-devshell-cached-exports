@@ -142,7 +142,7 @@ ${block//@ADDED@/\'\'}fi
 # takes it back out, so that a command run where nothing can be loaded finds
 # none of another project's environment, rather than the wrong one.
 print_unload() {
-  [[ -n ${__NDCE_ROOT-} ]] || return 0
+  [[ $mode == export && -n ${__NDCE_ROOT-} ]] || return 0
   local -a vars=()
   local name
   for name in ${!__NDCE_ADDED_@}; do

@@ -979,6 +979,14 @@ two_projects() {
   [ "$status" -eq 0 ]
   eval "$output"
   [ -z "${ONLY_A+set}" ] && [ "$PATH" = "$path_before_a" ]
+
+  # The other modes print only what they are asked for.
+  cd "$a"
+  run ndce
+  eval "$output"
+  cd "$BATS_TEST_TMPDIR"
+  run --separate-stderr ndce --print-key
+  [ "$status" -eq 0 ] && [ -z "$output" ]
 }
 
 @test "unload: the same project loaded twice keeps its variables" {
