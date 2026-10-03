@@ -53,6 +53,8 @@ setup() {
   export GIT_COMMITTER_NAME=test GIT_COMMITTER_EMAIL=test@example.com
 
   unset TMPDIR TMP TEMP TEMPDIR
+  # A load in the shell running the tests would otherwise be unloaded here.
+  unset "${!__NDCE_@}"
 }
 
 ndce() {
@@ -128,6 +130,23 @@ load_fixture() {
   [[ $env_path == /nix/store/* ]]
   nix-store --query --roots "$env_path" | grep -qF "$dir/$k.profile"
   [ -z "$(find "$dir" -name '.src.*')" ]
+}
+
+# 2 captures plus 1 retry: a devshell holding "${self}" depends on the
+# copy, so the capture falls back to the project, whose source has every
+# tracked file.
+@test "[e2e] a devshell built from the flake's own source is captured from the project" {
+  load_fixture flake-minimal
+  cd "$proj"
+  run ndce
+  [ "$status" -eq 0 ]
+  sed -i 's|{ nixpkgs, ... }:|{ self, nixpkgs, ... }:|; s|FIXTURE_MINIMAL = "1";|FIXTURE_MINIMAL = "1"; FIXTURE_SRC = "${self}";|' flake.nix
+  git add -A && git commit -q -m self-src
+
+  run ndce
+  [ "$status" -eq 0 ]
+  eval "$output"
+  [ -e "$FIXTURE_SRC/stub-env.sh" ]
 }
 
 @test "[e2e] git worktree gets its own root, cache dir, and \$PWD-derived value" {

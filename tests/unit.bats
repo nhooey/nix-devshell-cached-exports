@@ -44,8 +44,8 @@ setup() {
 
   unset TMPDIR TMP TEMP TEMPDIR
   # A load in the shell running the tests (this repo's own devshell, say)
-  # would make the first load here take its entries back out of PATH.
-  unset "${!__NDCE_ADDED_@}"
+  # would make the first load here take its environment back out.
+  unset "${!__NDCE_@}"
 }
 
 ndce() {
@@ -694,8 +694,8 @@ key() {
   run ndce --print-cache-path
   dir=${output%/*}
   # The key of a project without dependencies is the .nix files' own hash.
-  [ -e "$dir/$k1.v2.deps" ]
-  [ ! -s "$dir/$k1.v2.deps" ]
+  [ -e "$dir/$k1.v3.deps" ]
+  [ ! -s "$dir/$k1.v3.deps" ]
 }
 
 @test "a devshell launcher named after a command on PATH: warned at capture and once after" {
@@ -753,7 +753,7 @@ export FIXTURE_MINIMAL=1"
   printf 'x' >"$dir/fedcba9876543210fedcba9876543210.sh"
   touch -d '40 days ago' "$dir/0123456789abcdef0123456789abcdef.sh" \
     "$dir/0123456789abcdef0123456789abcdef.failed" "$dir/.$k.sh.AbCdEf" \
-    "$dir/$k.sh" "$dir/$k.v2.deps" "$dir/.lock"
+    "$dir/$k.sh" "$dir/$k.v3.deps" "$dir/.lock"
 
   run ndce --refresh
   [ "$status" -eq 0 ]
@@ -761,7 +761,7 @@ export FIXTURE_MINIMAL=1"
   [ ! -e "$dir/0123456789abcdef0123456789abcdef.failed" ]
   [ ! -e "$dir/.$k.sh.AbCdEf" ]
   [ -e "$dir/fedcba9876543210fedcba9876543210.sh" ]
-  [ -e "$dir/$k.v2.deps" ]
+  [ -e "$dir/$k.v3.deps" ]
   [ -e "$dir/.lock" ]
   [ -s "$cache_file" ]
   [ -L "$dir/last-good" ]
@@ -870,22 +870,38 @@ locked_flake() {
   [ -z "$(find "${output%/*}" -name '.src.*')" ]
 }
 
-@test "source: a directory reference, self as a path, or NDCE_FLAKE_SOURCE=tree uses the project" {
+@test "source: a reference to the project's own source still tries the copy first" {
   locked_flake
-  sed -i 's|FIXTURE_MINIMAL = "1";|FIXTURE_MINIMAL = "1"; src = ./.;|' flake.nix
-  git add -A && git commit -q -m dir
-  run ndce
-  [ "$status" -eq 0 ]
-  grep -q "^nix develop $proj " "$STUB_NIX_LOG"
-
-  sed -i 's|src = ./.;|src = inputs.self;|' flake.nix
+  sed -i 's|FIXTURE_MINIMAL = "1";|FIXTURE_MINIMAL = "1"; src = inputs.self; other = ./.;|' flake.nix
   git add -A && git commit -q -m self
-  : >"$STUB_NIX_LOG"
   run ndce
   [ "$status" -eq 0 ]
+  [ "$(nix_log_lines)" -eq 1 ]
+  grep -q '^nix develop path:' "$STUB_NIX_LOG"
+}
+
+@test "source: a devshell that depends on the copy is captured again from the project" {
+  locked_flake
+  touch REFS_SOURCE
+  git add -A && git commit -q -m refs
+  run ndce
+  [ "$status" -eq 0 ]
+  [ "$(nix_log_lines)" -eq 2 ]
+  grep -q '^nix develop path:' "$STUB_NIX_LOG"
+  grep -q "^nix develop $proj " "$STUB_NIX_LOG"
+}
+
+@test "source: a path reaching outside the project, or NDCE_FLAKE_SOURCE=tree, uses the project" {
+  locked_flake
+  mkdir -p ../sibling
+  sed -i 's|FIXTURE_MINIMAL = "1";|FIXTURE_MINIMAL = "1"; other = ../sibling;|' flake.nix
+  git add -A && git commit -q -m outside
+  run ndce
+  [ "$status" -eq 0 ]
+  [ "$(nix_log_lines)" -eq 1 ]
   grep -q "^nix develop $proj " "$STUB_NIX_LOG"
 
-  sed -i 's|src = inputs.self;||' flake.nix
+  sed -i 's|other = ../sibling;||' flake.nix
   git add -A && git commit -q -m plain
   : >"$STUB_NIX_LOG"
   NDCE_FLAKE_SOURCE=tree run ndce
@@ -896,13 +912,83 @@ locked_flake() {
   [ "$status" -eq 1 ]
 }
 
-@test "source: NDCE_FLAKE_SOURCE=minimal uses the copy despite a directory reference" {
+@test "source: NDCE_FLAKE_SOURCE=minimal keeps the copy without checking it" {
   locked_flake
-  sed -i 's|FIXTURE_MINIMAL = "1";|FIXTURE_MINIMAL = "1"; src = ./.;|' flake.nix
-  git add -A && git commit -q -m dir
+  touch REFS_SOURCE
+  git add -A && git commit -q -m refs
   NDCE_FLAKE_SOURCE=minimal run ndce
   [ "$status" -eq 0 ]
+  [ "$(nix_log_lines)" -eq 1 ]
   grep -q '^nix develop path:' "$STUB_NIX_LOG"
+}
+
+# Two projects with different devshells, loaded one after the other.
+two_projects() {
+  load_fixture flake-minimal "$BATS_TEST_TMPDIR/a"
+  a=$proj
+  set_stub_env 'export ONLY_A=1 SHARED=a PATH="/opt/a/bin:$PATH"'
+  load_fixture flake-minimal "$BATS_TEST_TMPDIR/b"
+  b=$proj
+  set_stub_env 'export SHARED=b'
+}
+
+@test "unload: loading another project takes the first one's variables and PATH entries out" {
+  two_projects
+  export SHARED=caller
+  cd "$a"
+  run ndce
+  [ "$status" -eq 0 ]
+  eval "$output"
+  [ "$ONLY_A" = 1 ] && [ "$SHARED" = a ]
+  [[ ":$PATH:" == *":/opt/a/bin:"* ]]
+
+  cd "$b"
+  run ndce
+  [ "$status" -eq 0 ]
+  eval "$output"
+  [ -z "${ONLY_A+set}" ]
+  [ "$SHARED" = b ]
+  [[ ":$PATH:" != *":/opt/a/bin:"* ]]
+  [ "$__NDCE_ROOT" = "$b" ]
+}
+
+@test "unload: a project that cannot load yet, or no project, leaves none of the last one's environment" {
+  two_projects
+  cd "$a"
+  run ndce
+  eval "$output"
+  [ "$ONLY_A" = 1 ]
+  path_before_a=${PATH#/opt/a/bin:}
+
+  # b is still capturing: nothing of a's may remain.
+  cd "$b"
+  STUB_NIX_SLEEP=3 run --separate-stderr ndce --max-wait 1
+  [ "$status" -eq 0 ]
+  [[ $stderr == *"still capturing"* ]]
+  eval "$output"
+  [ -z "${ONLY_A+set}" ] && [ -z "${IN_NIX_SHELL+set}" ] && [ -z "${__NDCE_ROOT+set}" ]
+  [ "$PATH" = "$path_before_a" ]
+
+  # Outside any project, the same.
+  cd "$a"
+  run ndce
+  eval "$output"
+  [ "$ONLY_A" = 1 ]
+  cd "$BATS_TEST_TMPDIR"
+  run ndce
+  [ "$status" -eq 0 ]
+  eval "$output"
+  [ -z "${ONLY_A+set}" ] && [ "$PATH" = "$path_before_a" ]
+}
+
+@test "unload: the same project loaded twice keeps its variables" {
+  two_projects
+  cd "$a"
+  run ndce
+  eval "$output"
+  run ndce
+  eval "$output"
+  [ "$ONLY_A" = 1 ]
 }
 
 @test "source: a copy that fails to evaluate is retried on the project" {

@@ -15,7 +15,7 @@ set -euo pipefail
 unset CDPATH
 
 readonly PROG=nix-devshell-cached-exports
-readonly FORMAT_VERSION=ndce-v2
+readonly FORMAT_VERSION=ndce-v3
 readonly IDENT_CHARS=ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_
 readonly LOCK_TIMEOUT=900
 readonly FAILED_TAIL_LINES=50
@@ -74,6 +74,82 @@ usage_error() {
 die() {
   printf '%s: %s\n' "$PROG" "$1" >&2
   exit 1
+}
+
+# ---------------------------------------------------------------------------
+# Output code shared by loading and unloading
+
+# Output code for one prepend variable (@VAR@, with @ADDED@ its quoted added
+# list). It must run in bash 3.2, zsh and POSIX sh, under set -eu: it puts the
+# added entries first and drops them, and whatever an earlier load recorded in
+# __NDCE_ADDED_@VAR@, from the caller's value, keeping its empty entries. The
+# caller's value is split in one step (zsh's (s.:.) flag, else IFS=: with
+# globbing off), since a per-entry ${v%%:*} loop is quadratic. With an empty
+# added list it only takes the earlier load's entries back out.
+# shellcheck disable=SC2016 # single quotes intended: this is output code
+PREPEND_TEMPLATE='__ndce_a=@ADDED@
+__ndce_o=${__NDCE_ADDED_@VAR@-}
+__ndce_v=${@VAR@-}
+__ndce_r=
+if [ "$__ndce_o" = "$__ndce_a" ]; then __ndce_o=; fi
+if [ -n "$__ndce_v" ]; then
+  if [ -n "${ZSH_VERSION-}" ]; then
+    eval '"'"'for __ndce_e in "${(@s.:.)__ndce_v}"; do
+      case $__ndce_e in "") __ndce_r="${__ndce_r}:" ;; *) case ":${__ndce_a}:${__ndce_o}:" in *":${__ndce_e}:"*) ;; *) __ndce_r="${__ndce_r}:${__ndce_e}" ;; esac ;; esac
+    done'"'"'
+  else
+    __ndce_g=
+    case $- in *f*) ;; *) __ndce_g=1; set -f ;; esac
+    if [ -n "${IFS+x}" ]; then __ndce_i=$IFS; __ndce_u=; else __ndce_i=; __ndce_u=1; fi
+    IFS=:
+    __ndce_v="${__ndce_v}:"
+    for __ndce_e in $__ndce_v; do
+      case $__ndce_e in "") __ndce_r="${__ndce_r}:" ;; *) case ":${__ndce_a}:${__ndce_o}:" in *":${__ndce_e}:"*) ;; *) __ndce_r="${__ndce_r}:${__ndce_e}" ;; esac ;; esac
+    done
+    if [ -n "$__ndce_u" ]; then unset IFS; else IFS=$__ndce_i; fi
+    if [ -n "$__ndce_g" ]; then set +f; fi
+  fi
+fi
+if [ -n "$__ndce_a" ]; then
+  export @VAR@="${__ndce_a}${__ndce_r}"
+  export __NDCE_ADDED_@VAR@="${__ndce_a}"
+else
+  export @VAR@="${__ndce_r#:}"
+  unset __NDCE_ADDED_@VAR@
+fi
+'
+readonly HELPER_VARS='__ndce_a __ndce_o __ndce_v __ndce_e __ndce_r __ndce_g __ndce_i __ndce_u'
+
+# unload_code VAR... : sets `unload` to output code that takes a loaded
+# project's environment back out of the caller's: the variables it added
+# (named in __NDCE_VARS) and its entries in each colon list VAR.
+unload_code() {
+  local var block
+  # shellcheck disable=SC2016 # single quotes intended: this is output code
+  unload='if [ -n "${__NDCE_VARS-}" ]; then eval "unset $__NDCE_VARS"; fi
+'
+  for var; do
+    block=${PREPEND_TEMPLATE//@VAR@/$var}
+    unload+="if [ -n \"\${__NDCE_ADDED_$var-}\" ]; then
+${block//@ADDED@/\'\'}fi
+"
+  done
+  unload+="unset __NDCE_ROOT __NDCE_VARS $HELPER_VARS
+"
+}
+
+# print_unload : with a project loaded in the caller, prints the code that
+# takes it back out, so that a command run where nothing can be loaded finds
+# none of another project's environment, rather than the wrong one.
+print_unload() {
+  [[ -n ${__NDCE_ROOT-} ]] || return 0
+  local -a vars=()
+  local name
+  for name in ${!__NDCE_ADDED_@}; do
+    vars+=("${name#__NDCE_ADDED_}")
+  done
+  unload_code ${vars[@]+"${vars[@]}"}
+  printf '%s' "$unload"
 }
 
 # ---------------------------------------------------------------------------
@@ -188,7 +264,10 @@ else
     d=${d%/*}
   done
 fi
-[[ -n $root ]] || exit 0 # outside any project
+if [[ -z $root ]]; then # outside any project
+  print_unload
+  exit 0
+fi
 
 in_git=0
 if [[ -n $git_top ]] && [[ $root == "$git_top" || $root == "$git_top"/* ]]; then
@@ -281,15 +360,15 @@ hash_files() {
 #   f PATH   a file whose contents join the key
 #   c        a shell.nix project looks up <...> paths: NIX_PATH and the
 #            channels join the key
-#   d PATH   a directory a path literal names (not part of the key: it
-#            tells a flake's capture that a minimal copy is not enough)
-#   s        the flake's own source (`self`) is used as a path (the same)
+#   d PATH   a directory outside the project that a path literal names (not
+#            part of the key: it tells a flake's capture that a copy of the
+#            project's files cannot stand in for the project)
 #
 # The scan errs towards including too much: a needless file only costs a
 # capture when it changes.
 
 # Bumped whenever the scan changes what it finds, so it scans again.
-readonly DEPS_VERSION=v2
+readonly DEPS_VERSION=v3
 
 # Lock files that *2nix tools read from a project's source.
 readonly -a LOCK_NAMES=(
@@ -305,9 +384,6 @@ LOCK_RE=${LOCK_NAMES[*]//./\\.}
 readonly LOCK_RE="(^|[^A-Za-z0-9._-])(${LOCK_RE// /|})([^A-Za-z0-9._-]|\$)"
 readonly ANGLE_RE='<[A-Za-z][A-Za-z0-9._-]*(/[A-Za-z0-9._+-]+)*>'
 readonly UP_RE='^\.\.(/\.\.)*$' # only .. segments
-# `self` (or `inputs.self`) used as a path: `src = self;`, "${self}",
-# `self + "/x"`, `self.outPath`, `cleanSource self`, `toString self`.
-readonly SELF_RE='(\$\{|[=(]|cleanSource(With)?|toString|fileset\.[A-Za-z]+)[[:space:]]*(inputs\.)?self([[:space:]]*([;})+]|$)|\.outPath)'
 
 # normalize PATH : sets `normal` to the relative PATH without `.` segments or
 # `dir/..` pairs ("." for the root itself).
@@ -340,8 +416,8 @@ normalize() {
 # `src = ./.` they mostly belong to examples and tests, not the devshell.
 scan_deps() {
   local -a nix_files=() locks=()
-  local -A dirs=() named=() found=()
-  local f m d p lock angle=0 self_src=0
+  local -A dirs=() named=() found=() outside=()
+  local f m d p lock angle=0
   deps=()
   for f in ${files[@]+"${files[@]}"}; do
     [[ $f == *.nix ]] && nix_files+=("$f")
@@ -350,10 +426,6 @@ scan_deps() {
 
   # -H -Z: each match is "FILE\0MATCH\n".
   while IFS= read -r -d '' f && IFS= read -r m; do
-    if [[ $m =~ $SELF_RE ]]; then
-      self_src=1
-      continue
-    fi
     if [[ $m == '<'* ]]; then
       angle=1
       continue
@@ -367,15 +439,16 @@ scan_deps() {
         found[$normal]=1
       elif [[ $normal =~ $UP_RE ]]; then
         dirs['.']=1 # a directory above the root holds the root's lock files
+        outside[$normal]=1
       elif [[ -d $normal ]]; then
         dirs[$normal]=1
+        [[ $normal != ..* ]] || outside[$normal]=1
       fi
     else
       normalize "$d/${m%%[!A-Za-z0-9._-]*}"
       named[$normal]=1
     fi
-  done < <(grep -oHZE -e "$PATH_RE" -e "$LOCK_RE" -e "$ANGLE_RE" -e "$SELF_RE" \
-    -- "${nix_files[@]}" 2>/dev/null)
+  done < <(grep -oHZE -e "$PATH_RE" -e "$LOCK_RE" -e "$ANGLE_RE" -- "${nix_files[@]}" 2>/dev/null)
 
   if ((${#dirs[@]} + ${#named[@]})); then
     if ((in_git)); then
@@ -407,11 +480,10 @@ scan_deps() {
     done
     deps+=("f $p")
   done
-  for p in "${!dirs[@]}"; do
+  for p in "${!outside[@]}"; do
     [[ $p != *$'\n'* ]] && deps+=("d $p")
   done
   ((! angle)) || [[ $kind == flake ]] || deps+=(c)
-  ((! self_src)) || deps+=(s)
   if ((${#deps[@]})); then
     mapfile -t deps < <(printf '%s\n' "${deps[@]}" | LC_ALL=C sort)
   fi
@@ -563,13 +635,14 @@ print_last_good() {
 # fail DETAILS_FILE | fail -m MESSAGE | fail -r MESSAGE : print the last good
 # environment with one warning line and exit 0; without one, print the details
 # on stderr (or, with -r, one line ending in MESSAGE) and exit 1 with nothing
-# on stdout.
+# on stdout but the code to unload a project already loaded.
 fail() {
   if print_last_good; then
     printf '%s: devshell capture failed for %s; using the last good environment. Fix it, then run: %s --refresh\n' \
       "$PROG" "$root" "$PROG" >&2
     exit 0
   fi
+  print_unload
   if [[ $1 == -r ]]; then
     printf '%s: devshell capture failed for %s; %s\n' "$PROG" "$root" "$2" >&2
     exit 1
@@ -606,6 +679,7 @@ still_capturing() {
     printf '%s: still capturing the devshell for %s; using the last good environment until it finishes\n' \
       "$PROG" "$root" >&2
   else
+    print_unload
     printf '%s: still capturing the devshell for %s; it loads once the capture finishes\n' \
       "$PROG" "$root" >&2
   fi
@@ -813,11 +887,12 @@ pre_sig=$hash
 pre_key=$key
 
 # A flake's source: `nix develop` on the project copies all of it into the
-# store, once for each state of it that the store has not seen. Where the
-# .nix files show no sign of reading anything but themselves and the files
-# the key covers, a copy of just those is evaluated instead (see
-# NDCE_FLAKE_SOURCE). Without a flake.lock the project itself is used, so
-# that nix writes the new lock file there.
+# store, once for each state of it that the store has not seen. So a copy of
+# just the files the key covers is tried first (see NDCE_FLAKE_SOURCE), and
+# the project itself is used when that copy fails to evaluate or the
+# devshell turns out to depend on it. Without a flake.lock, or with a path
+# literal reaching outside the project, the project itself is used straight
+# away, so that nix writes a new lock file there.
 src_dir=
 if [[ $kind == flake && $flake_source != tree ]]; then
   use_copy=0
@@ -827,15 +902,16 @@ if [[ $kind == flake && $flake_source != tree ]]; then
   copy=()
   for line in ${deps[@]+"${deps[@]}"}; do
     case $line in
-    'f ../'*) [[ $flake_source == minimal ]] || use_copy=0 ;;
+    'f ../'* | 'd '*) [[ $flake_source == minimal ]] || use_copy=0 ;;
     'f '*) copy+=("${line#f }") ;;
-    'd '* | s) [[ $flake_source == minimal ]] || use_copy=0 ;;
     esac
   done
   if ((use_copy)); then
     src_dir=$(mktemp -d "$cache_dir/.src.XXXXXX") || die "cannot create a directory in $cache_dir"
     tmp_dirs+=("$src_dir")
-    if ! cp --parents -- "${files[@]}" ${copy[@]+"${copy[@]}"} "$src_dir/" 2>/dev/null; then
+    # nix refuses a path: flake whose path runs through a symlink.
+    if ! src_dir=$(cd -P -- "$src_dir" && pwd) ||
+      ! cp --parents -- "${files[@]}" ${copy[@]+"${copy[@]}"} "$src_dir/" 2>/dev/null; then
       src_dir=
     fi
   fi
@@ -860,10 +936,34 @@ capture() {
     </dev/null >"$out_file" 2>"$err_file" {lock_fd}>&- || capture_status=$?
 }
 
+# copy_used : whether the devshell just captured from the copy depends on it,
+# as one with `src = self` in its packages or "${self}/src" in its wrappers
+# does: the copy's store path is in the devshell's closure. When that cannot
+# be told, it counts as used.
+copy_used() {
+  local meta p src='' env_path requisites
+  meta=$(env -i -- ${base_args[@]+"${base_args[@]}"} "$entry_bin" flake metadata --json \
+    "path:$src_dir" 2>/dev/null </dev/null {lock_fd}>&-) || return 0
+  while IFS= read -r p; do
+    p=${p#'"path":"'}
+    p=${p%'"'}
+    if [[ $p == "$store_dir"/?* ]]; then
+      src=$p
+      break
+    fi
+  done < <(printf '%s' "$meta" | grep -oE '"path":"[^"]*"')
+  [[ -n $src ]] || return 0
+  env_path=$(readlink -f -- "$profile") || return 0
+  requisites=$(env -i -- ${base_args[@]+"${base_args[@]}"} "${entry_bin%/*}/nix-store" \
+    --query --requisites "$env_path" 2>/dev/null </dev/null {lock_fd}>&-) || return 0
+  [[ $'\n'$requisites$'\n' == *$'\n'"$src"$'\n'* ]]
+}
+
 if [[ -n $src_dir ]]; then
   capture "path:$src_dir"
-  # The copy may lack a file the scan could not see: try the project itself.
-  if ((capture_status != 0)) && [[ $flake_source == auto ]]; then
+  # The copy may lack a file the scan could not see, or the devshell may be
+  # built from the source itself: then use the project.
+  if [[ $flake_source == auto ]] && { ((capture_status != 0)) || copy_used; }; then
     src_dir=
     capture "$root"
   fi
@@ -941,45 +1041,13 @@ is_excluded() {
   return 1
 }
 
-# Output code for one prepend variable (@VAR@, with @ADDED@ its quoted added
-# list). It must run in bash 3.2, zsh and POSIX sh, under set -eu: it puts the
-# added entries first and drops them, and whatever an earlier load recorded in
-# __NDCE_ADDED_@VAR@, from the caller's value, keeping its empty entries. The
-# caller's value is split in one step (zsh's (s.:.) flag, else IFS=: with
-# globbing off), since a per-entry ${v%%:*} loop is quadratic.
-# shellcheck disable=SC2016 # single quotes intended: this is output code
-PREPEND_TEMPLATE='__ndce_a=@ADDED@
-__ndce_o=${__NDCE_ADDED_@VAR@-}
-__ndce_v=${@VAR@-}
-__ndce_r=
-if [ "$__ndce_o" = "$__ndce_a" ]; then __ndce_o=; fi
-if [ -n "$__ndce_v" ]; then
-  if [ -n "${ZSH_VERSION-}" ]; then
-    eval '"'"'for __ndce_e in "${(@s.:.)__ndce_v}"; do
-      case $__ndce_e in "") __ndce_r="${__ndce_r}:" ;; *) case ":${__ndce_a}:${__ndce_o}:" in *":${__ndce_e}:"*) ;; *) __ndce_r="${__ndce_r}:${__ndce_e}" ;; esac ;; esac
-    done'"'"'
-  else
-    __ndce_g=
-    case $- in *f*) ;; *) __ndce_g=1; set -f ;; esac
-    if [ -n "${IFS+x}" ]; then __ndce_i=$IFS; __ndce_u=; else __ndce_i=; __ndce_u=1; fi
-    IFS=:
-    __ndce_v="${__ndce_v}:"
-    for __ndce_e in $__ndce_v; do
-      case $__ndce_e in "") __ndce_r="${__ndce_r}:" ;; *) case ":${__ndce_a}:${__ndce_o}:" in *":${__ndce_e}:"*) ;; *) __ndce_r="${__ndce_r}:${__ndce_e}" ;; esac ;; esac
-    done
-    if [ -n "$__ndce_u" ]; then unset IFS; else IFS=$__ndce_i; fi
-    if [ -n "$__ndce_g" ]; then set +f; fi
-  fi
-fi
-export @VAR@="${__ndce_a}${__ndce_r}"
-export __NDCE_ADDED_@VAR@="${__ndce_a}"
-'
-
 # Everything below goes after the header, filled in once the key is final.
 body=
 prepend_body=
 secrets=
 path_added=
+new_vars=
+declare -A prepended=()
 mapfile -t names < <(printf '%s\n' "${!dev_env[@]}" | LC_ALL=C sort)
 for name in "${names[@]}"; do
   value=${dev_env[$name]}
@@ -1026,6 +1094,7 @@ for name in "${names[@]}"; do
       clean=${clean#:}
       [[ -n $clean ]] || continue
       [[ $name != PATH ]] || path_added=$clean
+      prepended[$name]=1
       quote "$clean"
       block=${PREPEND_TEMPLATE//@VAR@/$name}
       prepend_body+=${block//@ADDED@/"$quoted"}
@@ -1045,11 +1114,32 @@ unset __NDCE_ADDED_$name
   quote "$value"
   body+="export $name=$quoted
 "
+  # Only a variable the caller did not have is unset on unloading.
+  [[ -n ${base_env[$name]+set} ]] || new_vars+=" $name"
 done
 if [[ -n $prepend_body ]]; then
-  prepend_body+="unset __ndce_a __ndce_o __ndce_v __ndce_e __ndce_r __ndce_g __ndce_i __ndce_u
+  prepend_body+="unset $HELPER_VARS
 "
 fi
+
+# Loading over another project first takes that one back out: its variables,
+# and its additions to the colon lists this one does not prepend to (this
+# one's own prepend code drops them from the rest).
+other_lists=()
+for name in ${prepend_vars[@]+"${prepend_vars[@]}"}; do
+  [[ -n ${prepended[$name]+set} ]] || other_lists+=("$name")
+done
+unload_code ${other_lists[@]+"${other_lists[@]}"}
+quote "$root"
+quoted_root=$quoted
+prelude="if [ \"\${__NDCE_ROOT-}\" != $quoted_root ]; then
+$unload
+fi
+"
+quote "${new_vars# }"
+tail="export __NDCE_ROOT=$quoted_root
+export __NDCE_VARS=$quoted
+"
 if [[ -n $secrets ]]; then
   warning+="$PROG: in $root, left out of the cache by NDCE_SECRET_VARS, so not set:$secrets."$'\n'
 fi
@@ -1091,8 +1181,8 @@ if [[ $hash != "$pre_sig" ]]; then
 fi
 
 header_root=${root//$'\n'/\\n}
-output="# $PROG v2 root=$header_root key=$key${witness:+ store=$witness}
-$body$prepend_body"
+output="# $PROG v3 root=$header_root key=$key${witness:+ store=$witness}
+$prelude$body$prepend_body$tail"
 
 new_tmp "$key"
 printf '%s' "$output" >"$tmp"

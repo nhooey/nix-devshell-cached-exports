@@ -20,6 +20,16 @@ usage_error() {
   exit 64
 }
 
+# nix flake metadata --json path:<dir> : the copy's store path is a fixed
+# name under the store directory (tests/stubs/nix-store reports it in the
+# closure of a project with a REFS_SOURCE file).
+if [ "${1-}" = flake ] && [ "${2-}" = metadata ]; then
+  [ "$3" = --json ] && [ "${4#path:}" != "$4" ] || usage_error "$@"
+  printf '{"path":"%s","locked":{"path":"%s"},"path":"%s/stub-source"}\n' \
+    "${4#path:}" "${4#path:}" "${NIX_STORE_DIR:-/nix/store}"
+  exit 0
+fi
+
 [ "$#" -ge 6 ] || usage_error "$@"
 [ "$1" = "develop" ] || usage_error "$@"
 ref=$2

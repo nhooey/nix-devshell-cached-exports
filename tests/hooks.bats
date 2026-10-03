@@ -40,13 +40,15 @@ wait_for_calls() {
 }
 
 EXPECTED_LINE='command -v nix-devshell-cached-exports >/dev/null 2>&1 && eval "$(nix-devshell-cached-exports </dev/null)"'
+EXPECTED_CD_LINE='cd() { builtin cd "$@" || return; command -v nix-devshell-cached-exports >/dev/null 2>&1 && eval "$(nix-devshell-cached-exports </dev/null)"; return 0; }'
 
 @test "stub on PATH: eval line appended once across two runs, stub invoked for warm-up" {
   PATH="$STUB_DIR:$BARE_PATH" CLAUDE_ENV_FILE="$ENV_FILE" run "$HOOK"
   [ "$status" -eq 0 ]
 
   [ -f "$ENV_FILE" ]
-  [ "$(grep -cF -- "$EXPECTED_LINE" "$ENV_FILE")" -eq 1 ]
+  [ "$(grep -cxF -- "$EXPECTED_LINE" "$ENV_FILE")" -eq 1 ]
+  [ "$(grep -cxF -- "$EXPECTED_CD_LINE" "$ENV_FILE")" -eq 1 ]
 
   wait_for_calls 1
   first_count="$(wc -l <"$STUB_LOG")"
@@ -55,8 +57,8 @@ EXPECTED_LINE='command -v nix-devshell-cached-exports >/dev/null 2>&1 && eval "$
   PATH="$STUB_DIR:$BARE_PATH" CLAUDE_ENV_FILE="$ENV_FILE" run "$HOOK"
   [ "$status" -eq 0 ]
 
-  [ "$(grep -cF -- "$EXPECTED_LINE" "$ENV_FILE")" -eq 1 ]
-  [ "$(wc -l <"$ENV_FILE")" -eq 1 ]
+  [ "$(grep -cxF -- "$EXPECTED_LINE" "$ENV_FILE")" -eq 1 ]
+  [ "$(wc -l <"$ENV_FILE")" -eq 2 ]
 
   # The stub was invoked again for the second run's warm-up.
   wait_for_calls $((first_count + 1))
@@ -67,13 +69,31 @@ EXPECTED_LINE='command -v nix-devshell-cached-exports >/dev/null 2>&1 && eval "$
   NDCE_STUB_SLEEP=3 PATH="$STUB_DIR:$BARE_PATH" CLAUDE_ENV_FILE="$ENV_FILE" run "$HOOK"
   [ "$status" -eq 0 ]
   [ $(($(date +%s) - start)) -lt 3 ]
-  [ "$(grep -cF -- "$EXPECTED_LINE" "$ENV_FILE")" -eq 1 ]
+  [ "$(grep -cxF -- "$EXPECTED_LINE" "$ENV_FILE")" -eq 1 ]
 }
 
-@test "command supports --max-wait: the eval line passes it" {
+@test "command supports --max-wait: the eval lines pass it" {
   NDCE_STUB_HELP='  --max-wait SECONDS  ...' PATH="$STUB_DIR:$BARE_PATH" CLAUDE_ENV_FILE="$ENV_FILE" run "$HOOK"
   [ "$status" -eq 0 ]
-  [ "$(cat "$ENV_FILE")" = 'command -v nix-devshell-cached-exports >/dev/null 2>&1 && eval "$(nix-devshell-cached-exports --max-wait 10 </dev/null)"' ]
+  [ "$(cat "$ENV_FILE")" = 'command -v nix-devshell-cached-exports >/dev/null 2>&1 && eval "$(nix-devshell-cached-exports --max-wait 10 </dev/null)"
+cd() { builtin cd "$@" || return; command -v nix-devshell-cached-exports >/dev/null 2>&1 && eval "$(nix-devshell-cached-exports --max-wait 10 </dev/null)"; return 0; }' ]
+}
+
+@test "the env file's cd loads again after changing directory, and keeps cd's status" {
+  PATH="$STUB_DIR:$BARE_PATH" CLAUDE_ENV_FILE="$ENV_FILE" run "$HOOK"
+  [ "$status" -eq 0 ]
+  wait_for_calls 1
+  : >"$STUB_LOG"
+  mkdir -p "$BATS_TEST_TMPDIR/sub"
+
+  for sh in bash zsh; do
+    command -v "$sh" >/dev/null 2>&1 || continue
+    run env PATH="$STUB_DIR:$BARE_PATH" "$sh" -c '. "$1"; unset NDCE_STUB_OK; cd "$2" && echo "$PWD $NDCE_STUB_OK"' _ "$ENV_FILE" "$BATS_TEST_TMPDIR/sub"
+    [ "$status" -eq 0 ]
+    [[ $output == *"/sub 1" ]]
+    run env PATH="$STUB_DIR:$BARE_PATH" "$sh" -c '. "$1"; cd /nonexistent-dir' _ "$ENV_FILE"
+    [ "$status" -ne 0 ]
+  done
 }
 
 @test "command absent from PATH: exit 0, one stderr line, env file untouched" {

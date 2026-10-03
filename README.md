@@ -6,7 +6,10 @@ devshell:
 
 ```console
 $ cd ~/src/project && nix-devshell-cached-exports
-# nix-devshell-cached-exports v2 root=/home/user/src/project key=8c1e0f3b9a… store=/nix/store/…-hello-2.12.3
+# nix-devshell-cached-exports v3 root=/home/user/src/project key=8c1e0f3b9a… store=/nix/store/…-hello-2.12.3
+if [ "${__NDCE_ROOT-}" != '/home/user/src/project' ]; then
+…
+fi
 export CC='clang'
 export FOO='multi
 line '\''q'\'' $x'
@@ -15,16 +18,17 @@ export PROJECT_ROOT='/home/user/src/project'
 …
 __ndce_a='/nix/store/…-hello-2.12.3/bin:/nix/store/…-clang-wrapper-21.1.8/bin:…'
 …
-export PATH="${__ndce_a}${__ndce_r}"
-export __NDCE_ADDED_PATH="${__ndce_a}"
 …
+export __NDCE_ROOT='/home/user/src/project'
+export __NDCE_VARS='CC FOO IN_NIX_SHELL PROJECT_ROOT …'
 ```
 
 Every value is single-quoted. `PATH` and `XDG_DATA_DIRS` are not absolute:
 the devshell's entries go in front of the caller's own, and sourcing the
-output twice, or after another project's, leaves no duplicates. The output
-sources in bash 3.2, zsh and POSIX `sh`, and leaves no helper variables
-behind.
+output twice, or after another project's, leaves no duplicates. Loading over
+another project first unsets the variables that project added (named in
+`__NDCE_VARS`) and takes its entries out of those lists. The output sources
+in bash 3.2, zsh and POSIX `sh`, and leaves no helper variables behind.
 
 A caller loads that with `eval "$(nix-devshell-cached-exports)"`. The first
 call for a given set of devshell-defining files runs the real entry command
@@ -66,8 +70,19 @@ stderr saying so and how to install it, and otherwise does nothing; the
 session still starts normally. The plugin refers to the command by name
 only — no store paths, no vendored copy, no `nix run`.
 
-Only `SessionStart` adds that line, and `/reload-plugins` does not run it: a
-session that installs or enables the plugin partway through gets the
+The environment loads before each command runs, so in
+`cd .worktrees/topic && make` the `cd` comes after the load. The hook also
+adds a `cd` shell function that loads again for the new directory, so
+`make` gets the worktree's environment. That costs a cached load, 20–40 ms,
+per `cd`; the first `cd` into a directory with no capture yet (a new
+worktree has its own cache) waits up to 10 seconds for one, running the
+devshell's shell hooks there. A load that has nothing for its directory
+yet, or that runs outside any project, takes the previous project's
+environment back out, so a command fails to find that project's tools
+rather than running them against the wrong checkout.
+
+Only `SessionStart` adds those lines, and `/reload-plugins` does not run it:
+a session that installs or enables the plugin partway through gets the
 devshell after a restart (`claude --resume` keeps the conversation).
 
 ### `.envrc`
@@ -137,7 +152,7 @@ ${XDG_CACHE_HOME:-$HOME/.cache}/nix-devshell-cached-exports/<rootid>/
   <key>.sh        # a good capture (the exact text printed)
   <key>.failed    # failure marker: tail of nix's stderr
   <key>.profile   # a flake's GC root: keeps its devshell in the store
-  <hash>.v2.deps  # other files the .nix files with this hash depend on
+  <hash>.v3.deps  # other files the .nix files with this hash depend on
   last-good       # symlink -> <key>.sh of the most recent good capture
   .lock           # flock target
 ```
@@ -153,7 +168,7 @@ characters of a sha256 over a format-version tag, the project kind (with
 files produces a new key and a fresh capture on the next call.
 
 When those files change, a rough scan of the `*.nix` files finds what else
-the devshell may read, records it in `<hash>.v2.deps`, and folds it into the
+the devshell may read, records it in `<hash>.v3.deps`, and folds it into the
 key:
 
 - a file named by a relative path literal, such as
@@ -169,7 +184,7 @@ key:
   and the targets of the channel profiles, so a channel update recaptures.
 
 The scan errs towards including too much: an extra file only costs a capture
-when it changes. A cache hit never scans: it reads `<hash>.v2.deps`, which is
+when it changes. A cache hit never scans: it reads `<hash>.v3.deps`, which is
 empty for most projects, and hashes the files it lists. Dependencies the scan
 cannot see, such as an unpinned `fetchTarball` or a path built from strings,
 still need `--refresh`.
@@ -186,19 +201,20 @@ projects that no longer exist are left in place; delete them by hand.
 
 `nix develop` on a flake in a git checkout copies every tracked file into
 the store, once for each state of the tree it has not seen; for a large
-repository that adds up. So when the scan finds the `.nix` files reading
-nothing but themselves, the files the key covers and the files it found, a
-flake with a `flake.lock` is captured from a copy of just those files
+repository that adds up. So a flake with a `flake.lock` is first captured
+from a copy of just the files the key covers and the files the scan found
 (`nix develop path:<copy>`), still from the project root, so shell hooks see
-the project as `$PWD`. A path literal naming a directory (`src = ./.;`), or
-`self` used as a path (`src = self;`, `"${self}"`), means the devshell may
-need more, so the capture uses the project itself; so does a copy that fails
-to evaluate. If the copy's capture updates `flake.lock`, the project's is
-updated to match, as `nix develop` would. `NDCE_FLAKE_SOURCE` overrides the
-choice: `minimal` always uses the copy, for a flake whose devshell needs none
-of what its packages read; `tree` always uses the project. Per project, set
-it in `.claude/settings.json` (`"env": {"NDCE_FLAKE_SOURCE": "minimal"}`) or
-in `.envrc`.
+the project as `$PWD`. The capture uses the project itself instead when the
+copy fails to evaluate, or when the copy's store path turns up in the
+devshell's closure: a devshell built from the flake's source (`src = self;`
+in a package it includes, `"${self}/src"` in a wrapper) depends on it, where
+`src = self;` in packages and checks the devshell does not use costs
+nothing. A path literal reaching outside the project (`../shared`) goes to
+the project straight away. If the copy's capture updates `flake.lock`, the
+project's is updated to match, as `nix develop` would. `NDCE_FLAKE_SOURCE`
+overrides the choice: `minimal` always keeps the copy, unchecked; `tree`
+always uses the project. Per project, set it in `.claude/settings.json`
+(`"env": {"NDCE_FLAKE_SOURCE": "tree"}`) or in `.envrc`.
 
 A flake's capture keeps its devshell as a GC root, `<key>.profile`, so a
 garbage collection leaves a cached environment's store paths in place; the

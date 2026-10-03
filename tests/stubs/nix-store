@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# Test stub for `nix-store`, standing in for real nix in the bats sandbox
+# (tests/unit.bats). Supports the one query nix-devshell-cached-exports makes
+# after capturing from a copy of a flake's files:
+#
+#   nix-store --query --requisites <path>
+#
+# It prints <path>, and for a project (the current directory) with a
+# REFS_SOURCE file also the copy's store path that tests/stubs/nix reports,
+# as the closure of a devshell built from the flake's own source would.
+set -euo pipefail
+
+if [ "$#" -ne 3 ] || [ "$1" != --query ] || [ "$2" != --requisites ]; then
+  echo "stub-nix-store: unsupported invocation: $*" >&2
+  exit 64
+fi
+
+printf '%s\n' "$3"
+if [ -e "$PWD/REFS_SOURCE" ]; then
+  printf '%s/stub-source\n' "${NIX_STORE_DIR:-/nix/store}"
+fi
