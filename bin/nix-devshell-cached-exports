@@ -21,6 +21,8 @@ readonly LOCK_TIMEOUT=900
 readonly FAILED_TAIL_LINES=50
 # A capture deletes this project's cache files untouched for longer than this.
 readonly PRUNE_DAYS=30
+# --prune keeps the entries written within this many days (--keep-days).
+readonly PRUNE_KEEP_DAYS=7
 # The Nix store, where a cache entry's devshell lives.
 store_dir=${NIX_STORE_DIR:-/nix/store}
 store_dir=${store_dir%/}
@@ -43,6 +45,7 @@ usage() {
 Usage: $PROG [export] [--dir PATH] [--refresh | --max-wait SECONDS] [--format bash]
        $PROG --print-key [--dir PATH]
        $PROG --print-cache-path [--dir PATH]
+       $PROG --prune [--keep-days N] [--dry-run]
        $PROG -h | --help
 
 Print the environment the project's Nix devshell adds, as export statements,
@@ -59,6 +62,10 @@ from a cache keyed on the files that define the devshell:
   --format bash       output format (only bash, which zsh also sources)
   --print-key         print the cache key and exit
   --print-cache-path  print the path of the cache entry for the current key
+  --prune             in every project's cache folder, delete the entries (and
+                      their GC roots) but the newest and those written within
+                      --keep-days N days (default: $PRUNE_KEEP_DAYS)
+  --dry-run           with --prune, print what would go and delete nothing
   -h, --help          show this help
 
 Outside a Nix project it prints nothing and exits 0.
@@ -160,6 +167,8 @@ dir=.
 dir_given=0
 refresh=0
 max_wait=
+keep_days=
+dry_run=0
 
 set_mode() {
   if [[ -n $mode && $mode != "$1" ]]; then
@@ -206,6 +215,17 @@ while (($#)); do
   --format=*) set_format "${1#--format=}" ;;
   --print-key) set_mode print-key ;;
   --print-cache-path) set_mode print-cache-path ;;
+  --prune) set_mode prune ;;
+  --keep-days)
+    (($# >= 2)) || usage_error "--keep-days needs a number of days"
+    keep_days=$2
+    shift
+    ;;
+  --keep-days=*)
+    keep_days=${1#--keep-days=}
+    [[ -n $keep_days ]] || usage_error "--keep-days needs a number of days"
+    ;;
+  --dry-run) dry_run=1 ;;
   -h | --help)
     usage
     exit 0
@@ -219,6 +239,134 @@ mode=${mode:-export}
 if [[ -n $max_wait ]]; then
   [[ $max_wait != *[!0123456789]* ]] || usage_error "--max-wait needs a number of seconds: $max_wait"
   ((! refresh)) || usage_error "--max-wait and --refresh cannot be combined"
+fi
+
+if [[ $mode == prune ]]; then
+  ((! dir_given && ! refresh)) && [[ -z $max_wait ]] ||
+    usage_error "--prune cannot be combined with --dir, --refresh or --max-wait"
+  keep_days=${keep_days:-$PRUNE_KEEP_DAYS}
+  [[ $keep_days != *[!0123456789]* && ${#keep_days} -le 5 ]] ||
+    usage_error "--keep-days needs a number of days: $keep_days"
+elif [[ -n $keep_days ]] || ((dry_run)); then
+  usage_error "--keep-days and --dry-run need --prune"
+fi
+
+if [[ ${XDG_CACHE_HOME-} == /* ]]; then
+  cache_base=$XDG_CACHE_HOME
+elif [[ -n ${HOME-} ]]; then
+  cache_base=$HOME/.cache
+else
+  cache_base=
+fi
+
+# ---------------------------------------------------------------------------
+# --prune: a capture prunes only its own project's folder (see the end of
+# this script), so the folders of projects nobody visits any more keep every
+# entry, and every GC root, they ever had. This sweeps all of them.
+
+# prune_folder DIR : deletes (or, with --dry-run, prints) the files of DIR's
+# entries other than the newest, the one last-good names, and those with a
+# file written within keep_days; also temp files a killed call left behind.
+# An entry is the files named <key>.*, as the capture's prune judges them; a
+# <hash>.v3.deps record whose hash is not a key is an entry of its own, and
+# the newest of those is kept too. Never `.lock` or `last-good`. Adds to the
+# counters `pruned_entries`, `pruned_roots`, `pruned_files` and
+# `pruned_folders`.
+prune_folder() {
+  local dir=$1 t name stem target newest='' newest_t=-1 newest_deps='' deps_t=-1
+  local -A stem_t=() is_entry=() keep=()
+  local -a names=() gone=()
+  local -i entries=0
+  while IFS=' ' read -r -d '' t name; do
+    t=${t%.*}
+    [[ $name != .lock && $name != last-good ]] || continue
+    names+=("$t $name")
+    [[ $name != .* ]] || continue
+    stem=${name%%.*}
+    # (No ((a[$stem])): an arithmetic subscript would expand the name again.)
+    if ((t > ${stem_t[$stem]--1})); then
+      stem_t[$stem]=$t
+    fi
+    if [[ $name == *.deps ]]; then
+      if ((t > deps_t)); then
+        newest_deps=$stem deps_t=$t
+      fi
+    else
+      is_entry[$stem]=1
+    fi
+    if [[ $name == "$stem.sh" ]] && ((t > newest_t)); then
+      newest=$stem newest_t=$t
+    fi
+  done < <(find "$dir" -mindepth 1 -maxdepth 1 \( -type f -o -type l \) -printf '%T@ %f\0' 2>/dev/null)
+
+  [[ -z $newest ]] || keep[$newest]=1
+  [[ -z $newest_deps ]] || keep[$newest_deps]=1
+  target=$(readlink -- "$dir/last-good" 2>/dev/null) || target=
+  [[ -z $target ]] || keep[${target%%.*}]=1
+  for stem in "${!stem_t[@]}"; do
+    t=${stem_t[$stem]}
+    if ((t > cutoff)); then
+      keep[$stem]=1
+    elif [[ -z ${keep[$stem]+set} && -n ${is_entry[$stem]+set} ]]; then
+      entries+=1
+    fi
+  done
+
+  for name in ${names[@]+"${names[@]}"}; do
+    t=${name%% *}
+    name=${name#* }
+    if [[ $name == .* ]]; then
+      ((t <= cutoff)) || continue
+    else
+      [[ -z ${keep[${name%%.*}]+set} ]] || continue
+    fi
+    gone+=("$dir/$name")
+    [[ $name != *.profile ]] || pruned_roots+=1
+  done
+  ((${#gone[@]})) || return 0
+  pruned_entries+=entries
+  pruned_files+=${#gone[@]}
+  pruned_folders+=1
+  if ((dry_run)); then
+    printf '%s\n' "${gone[@]}"
+  else
+    rm -f -- "${gone[@]}"
+  fi
+}
+
+# prune_all : prunes every project folder in the cache. A folder whose lock
+# a capture holds is left alone: that capture prunes it itself.
+prune_all() {
+  local base=$cache_base/$PROG folder fd
+  local -i pruned_entries=0 pruned_roots=0 pruned_files=0 pruned_folders=0 folders=0 busy=0
+  local -i cutoff
+  printf -v cutoff '%(%s)T' -1
+  cutoff=$((cutoff - keep_days * 86400))
+  for folder in "$base"/*; do
+    [[ ${folder##*/} =~ ^[0-9a-f]{16}$ && -d $folder && ! -L $folder ]] || continue
+    folders+=1
+    if ((dry_run)); then
+      prune_folder "$folder"
+      continue
+    fi
+    if ! exec {fd}>>"$folder/.lock" 2>/dev/null || ! flock -n "$fd"; then
+      busy+=1
+    else
+      prune_folder "$folder"
+    fi
+    [[ -z ${fd-} ]] || exec {fd}>&-
+    fd=
+  done
+  printf '%s: %s %d entries and %d GC roots (%d files) in %d of %d project folders, keeping each one'"'"'s newest entry and those from the last %d days%s\n' \
+    "$PROG" "$( ((dry_run)) && echo 'would remove' || echo removed)" \
+    "$pruned_entries" "$pruned_roots" "$pruned_files" "$pruned_folders" "$folders" "$keep_days" \
+    "$( ((busy)) && echo "; skipped $busy folders it could not lock")"
+}
+
+if [[ $mode == prune ]]; then
+  [[ -n $cache_base ]] || die "cannot locate the cache: neither XDG_CACHE_HOME nor HOME is set"
+  prune_all
+  exit 0
 fi
 
 # What a flake's capture evaluates: `auto` a copy of only the files the key
@@ -544,13 +692,6 @@ compute_key() {
   cache_file=${cache_dir:+$cache_dir/$key.sh}
 }
 
-if [[ ${XDG_CACHE_HOME-} == /* ]]; then
-  cache_base=$XDG_CACHE_HOME
-elif [[ -n ${HOME-} ]]; then
-  cache_base=$HOME/.cache
-else
-  cache_base=
-fi
 cache_dir=
 compute_key
 
