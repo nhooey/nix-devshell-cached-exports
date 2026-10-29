@@ -179,6 +179,7 @@ fi
 nix-devshell-cached-exports [export] [--dir PATH] [--refresh | --max-wait SECONDS] [--format bash]
 nix-devshell-cached-exports --print-key [--dir PATH]
 nix-devshell-cached-exports --print-cache-path [--dir PATH]
+nix-devshell-cached-exports --prune [--keep-days N] [--dry-run]
 nix-devshell-cached-exports -h | --help
 ```
 
@@ -195,6 +196,10 @@ nix-devshell-cached-exports -h | --help
   supported yet".
 - `--print-key` prints the cache key; `--print-cache-path` prints the path
   of the cache entry. Neither captures anything.
+- `--prune` sweeps the cache folders of every project, not only the current
+  one's (see [Pruning](#pruning)). `--keep-days N` (default 7) sets how
+  recent an entry must be to stay; `--dry-run` prints the paths it would
+  delete and deletes nothing. It ends with a one-line summary.
 - Outside a Nix project (no `flake.nix`, `shell.nix` or `default.nix` in the
   directory or above it), it prints nothing and exits 0, so it's safe to
   call anywhere.
@@ -236,10 +241,17 @@ ${XDG_CACHE_HOME:-$HOME/.cache}/nix-devshell-cached-exports/<rootid>/
   <key>.sh        # a good capture: the exact text printed
   <key>.failed    # failure marker: the end of nix's stderr
   <key>.profile   # a flake's GC root, keeping its devshell in the store
+  <key>.profile-<n>-link  # the profile generation <key>.profile points at
+  <key>.warn      # a capture's warning, shown on the next load
   <hash>.v3.deps  # other files the .nix files with this hash depend on
   last-good       # symlink to the most recent good <key>.sh
-  .lock           # flock target
+  .lock           # flock target, held by a capture and by --prune
+  .<name>.XXXXXX  # a temp file, left only by a call that was killed
 ```
+
+An entry is the files named `<key>.*`. Its `.deps` record is named for the
+hash of the `.nix` files alone, which is the key itself unless the devshell
+depends on other files.
 
 - **`<rootid>`** comes from the project root's absolute path, so each git
   worktree has its own cache.
@@ -278,8 +290,56 @@ usually empty, and hashes those files.
 Each successful capture deletes the project's cache files not written for
 30 days, other than the new entry, `last-good` and `.lock`. A cache hit
 doesn't count as a write, so an old entry that is still in use, such as
-another branch's, can be pruned and cost one capture later. Cache
-directories of deleted projects stay; remove them by hand.
+another branch's, can be pruned and cost one capture later.
+
+That only reaches the project being captured. A project you stop visiting
+keeps every entry it ever had, and with it a GC root per version of its
+`.nix` files. `nix-devshell-cached-exports --prune` sweeps every project's
+folder instead. In each, it keeps:
+
+- the newest entry (by its `<key>.sh`), and the one `last-good` names;
+- every entry with a file written within `--keep-days N` days (default 7);
+- the newest `.deps` record, since one named for a hash that is not a key
+  can't be matched to its entry by name;
+- `.lock` and `last-good`, always, and temp files younger than `N` days.
+
+Everything else goes: `.sh`, `.failed`, `.warn`, `.deps` and the GC root
+(`<key>.profile` and its `-<n>-link`). It takes each folder's lock without
+waiting, so it never deletes from a folder a capture is writing to; it skips
+that folder and says so. With `--dry-run` it takes no lock, lists the paths
+that would go and deletes nothing. Either way it ends with one line:
+
+```console
+$ nix-devshell-cached-exports --prune --dry-run | tail -n 1
+nix-devshell-cached-exports: would remove 673 entries and 517 GC roots (2220 files) in 181 of 575 project folders, keeping each one's newest entry and those from the last 7 days
+```
+
+The folder of a deleted project keeps its newest entry; remove the folder by
+hand.
+
+**On a schedule (nix-darwin).** The flake exports a module that runs it
+weekly from a launchd user agent:
+
+```nix
+{
+  imports = [ inputs.nix-devshell-cached-exports.darwinModules.default ];
+  services.nix-devshell-cached-exports.prune = {
+    enable = true;
+    user = "alice";   # whose ~/.cache it prunes
+    # keepDays = 7;
+    # interval = [ { Weekday = 7; Hour = 3; Minute = 0; } ];  # Sunday 03:00
+    # package = inputs.nix-devshell-cached-exports.packages.${system}.default;
+  };
+}
+```
+
+`interval` is launchd's `StartCalendarInterval`, where Sunday is 7 (or 0),
+as in `nix.gc.interval`. The default runs 15 minutes before nix-darwin's
+default `nix.gc` (Sunday 03:15), so that collection frees the devshells the
+prune let go of. If the Mac is asleep at both times, launchd runs both on
+waking, in no set order; the prune's roots then go at the following
+collection. The agent loads for every user who logs in but only prunes as
+`user`, logging to `~/Library/Logs/nix-devshell-cached-exports-prune.log`.
 
 ### Store copies, GC roots and secrets
 
@@ -304,8 +364,12 @@ in `.claude/settings.json` (`"env": {"NDCE_FLAKE_SOURCE": "tree"}`) or in
 
 **GC roots.** A flake's capture registers its devshell as a GC root
 (`<key>.profile`), so garbage collection keeps a cached environment's store
-paths. The root goes when its entry is pruned. A `shell.nix` capture has no
-root. Either way, each entry names a store path its `PATH` needs, and a load
+paths. The root goes when its entry is pruned, by a capture of that project
+or by `--prune` (see [Pruning](#pruning)): the link in the cache folder is
+deleted, and Nix drops the dangling entry in `/nix/var/nix/gcroots/auto` at
+its next collection, along with any store paths only it kept. While an
+entry stays, its root holds the devshell through every collection,
+`--delete-older-than` or not. A `shell.nix` capture has no root. Either way, each entry names a store path its `PATH` needs, and a load
 that finds it gone captures again.
 
 **Secrets.** The cache directory is readable only by its owner, but it is

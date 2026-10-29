@@ -767,6 +767,123 @@ export FIXTURE_MINIMAL=1"
   [ -L "$dir/last-good" ]
 }
 
+# prune_entry DIR KEY AGE : a cache entry as a flake capture leaves it: the
+# exports, the deps record and the GC root (profile and generation links),
+# all last written AGE ago (a `touch -d` date).
+prune_entry() {
+  mkdir -p "$1"
+  printf 'x' >"$1/$2.sh"
+  : >"$1/$2.v3.deps"
+  ln -s "$BATS_TEST_TMPDIR/store/$2-env" "$1/$2.profile-1-link"
+  ln -s "$2.profile-1-link" "$1/$2.profile"
+  touch -h -d "$3" "$1/$2.sh" "$1/$2.v3.deps" "$1/$2.profile" "$1/$2.profile-1-link"
+}
+
+# Two project folders. In `a`: entries 40 days old (with a failure marker
+# and a temp file), 30 days old (the one last-good names), 10 days old, and
+# 2 days old (the newest), plus a fresh temp file; last-good and .lock are
+# 40 days old. In `b`: entries 50 and 20 days old.
+prune_cache() {
+  a=$XDG_CACHE_HOME/nix-devshell-cached-exports/aaaaaaaaaaaaaaaa
+  b=$XDG_CACHE_HOME/nix-devshell-cached-exports/bbbbbbbbbbbbbbbb
+  old=11111111111111111111111111111111
+  mid=22222222222222222222222222222222
+  new=33333333333333333333333333333333
+  good=44444444444444444444444444444444
+  prune_entry "$a" "$old" '40 days ago'
+  prune_entry "$a" "$good" '30 days ago'
+  prune_entry "$a" "$mid" '10 days ago'
+  prune_entry "$a" "$new" '2 days ago'
+  printf 'x' >"$a/$old.failed"
+  touch -d '40 days ago' "$a/$old.failed"
+  ln -s "$good.sh" "$a/last-good"
+  printf 'x' >"$a/.$old.sh.AbCdEf"
+  printf 'x' >"$a/.$new.sh.GhIjKl"
+  touch -h -d '40 days ago' "$a/last-good" "$a/.$old.sh.AbCdEf"
+  : >"$a/.lock"
+  touch -d '40 days ago' "$a/.lock"
+  prune_entry "$b" "$old" '50 days ago'
+  prune_entry "$b" "$mid" '20 days ago'
+  : >"$b/.lock"
+  touch -d '50 days ago' "$b/.lock"
+}
+
+@test "--prune: keeps each folder's newest entry, entries newer than --keep-days and last-good's; deletes the rest with their GC roots" {
+  prune_cache
+  run --separate-stderr ndce --prune --keep-days 7
+  [ "$status" -eq 0 ]
+  [[ $output == *"removed 3 entries and 3 GC roots (14 files) in 2 of 2 project folders"* ]]
+
+  # a: the old entry goes, with its root, record, failure marker and temp file.
+  for f in "$old.sh" "$old.v3.deps" "$old.profile" "$old.profile-1-link" "$old.failed" ".$old.sh.AbCdEf"; do
+    [ ! -e "$a/$f" ] && [ ! -L "$a/$f" ]
+  done
+  # The 10-day-old entry goes too: newer ones exist and it is past --keep-days.
+  [ ! -e "$a/$mid.sh" ] && [ ! -L "$a/$mid.profile" ]
+  # The 2-day-old one stays (newest, and within --keep-days); so does the one
+  # last-good names, however old, and last-good, .lock and the fresh temp file.
+  for f in "$new.sh" "$new.v3.deps" "$new.profile" "$new.profile-1-link" \
+    "$good.sh" "$good.profile" "$good.profile-1-link" last-good .lock ".$new.sh.GhIjKl"; do
+    [ -e "$a/$f" ] || [ -L "$a/$f" ]
+  done
+  # b: everything is old, so only its newest entry stays.
+  [ ! -e "$b/$old.sh" ] && [ ! -L "$b/$old.profile" ] && [ ! -L "$b/$old.profile-1-link" ]
+  [ -e "$b/$mid.sh" ] && [ -L "$b/$mid.profile" ] && [ -L "$b/$mid.profile-1-link" ]
+  [ -e "$b/.lock" ]
+}
+
+@test "--prune --keep-days 0 keeps only the newest entry and last-good's; the default keeps 7 days" {
+  prune_cache
+  run ndce --prune
+  [ "$status" -eq 0 ]
+  [ -e "$a/$new.sh" ]
+  run ndce --prune --keep-days=0
+  [ "$status" -eq 0 ]
+  [ -e "$a/$new.sh" ] && [ -e "$a/$good.sh" ] && [ -e "$b/$mid.sh" ]
+  [ "$(find "$a" -name '*.sh' | wc -l)" -eq 2 ]
+}
+
+@test "--prune --dry-run lists what would go, by path, and deletes nothing" {
+  prune_cache
+  before=$(find "$XDG_CACHE_HOME" | LC_ALL=C sort)
+  run --separate-stderr ndce --prune --dry-run
+  [ "$status" -eq 0 ]
+  [ "$(find "$XDG_CACHE_HOME" | LC_ALL=C sort)" = "$before" ]
+  [[ $output == *"$a/$old.profile"$'\n'* ]]
+  [[ $output == *"$b/$old.sh"$'\n'* ]]
+  [[ $output != *"$new."* && $output != *"$good."* && $output != *last-good* && $output != *.lock* ]]
+  [ "$(grep -c '^/' <<<"$output")" -eq 14 ]
+  [[ ${lines[-1]} == *"would remove 3 entries and 3 GC roots (14 files)"* ]]
+}
+
+@test "--prune leaves a folder a capture has locked alone" {
+  prune_cache
+  exec 9>>"$b/.lock"
+  flock 9
+  run ndce --prune
+  exec 9>&-
+  [ "$status" -eq 0 ]
+  [[ $output == *"in 1 of 2 project folders"*"skipped 1 folders it could not lock"* ]]
+  [ -e "$b/$old.sh" ] && [ -L "$b/$old.profile" ]
+  [ ! -e "$a/$old.sh" ]
+}
+
+@test "--prune with no cache, or with other modes' options, and those options without it" {
+  run ndce --prune --dry-run
+  [ "$status" -eq 0 ]
+  [[ $output == *"0 of 0 project folders"* ]]
+  run ndce --prune --refresh
+  [ "$status" -eq 2 ]
+  run ndce --prune --dir .
+  [ "$status" -eq 2 ]
+  run ndce --prune --keep-days 1x
+  [ "$status" -eq 2 ]
+  run ndce --dry-run
+  [ "$status" -eq 2 ]
+  run ndce --print-key --keep-days 3
+  [ "$status" -eq 2 ]
+}
+
 # A fake store, with one devshell path in it, for the PATH and GC tests.
 fake_store() {
   export NIX_STORE_DIR=$BATS_TEST_TMPDIR/store
