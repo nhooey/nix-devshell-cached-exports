@@ -812,7 +812,7 @@ prune_cache() {
   prune_cache
   run --separate-stderr ndce --prune --keep-days 7
   [ "$status" -eq 0 ]
-  [[ $output == *"removed 3 entries and 3 GC roots (14 files) in 2 of 2 project folders"* ]]
+  [[ $output == *"removed 3 entries and 3 GC roots (14 files, "*"B) in 2 of 2 project folders"* ]]
 
   # a: the old entry goes, with its root, record, failure marker and temp file.
   for f in "$old.sh" "$old.v3.deps" "$old.profile" "$old.profile-1-link" "$old.failed" ".$old.sh.AbCdEf"; do
@@ -853,7 +853,12 @@ prune_cache() {
   [[ $output == *"$b/$old.sh"$'\n'* ]]
   [[ $output != *"$new."* && $output != *"$good."* && $output != *last-good* && $output != *.lock* ]]
   [ "$(grep -c '^/' <<<"$output")" -eq 14 ]
-  [[ ${lines[-1]} == *"would remove 3 entries and 3 GC roots (14 files)"* ]]
+  # The summary's size is the listed files' own sizes, symlinks not followed.
+  bytes=0
+  while IFS= read -r f; do
+    bytes=$((bytes + $(find "$f" -maxdepth 0 -printf '%s')))
+  done < <(grep '^/' <<<"$output")
+  [[ ${lines[-1]} == *"would remove 3 entries and 3 GC roots (14 files, $(numfmt --to=iec-i --suffix=B "$bytes"))"* ]]
 }
 
 @test "--prune leaves a folder a capture has locked alone" {
