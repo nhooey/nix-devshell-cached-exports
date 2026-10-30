@@ -356,8 +356,12 @@ capture falls back to the project itself when:
   self;` in packages the devshell doesn't use costs nothing;
 - a path reaches outside the project (`../shared`).
 
-If capturing from the copy updates `flake.lock`, the project's is updated
-too, as `nix develop` would. `NDCE_FLAKE_SOURCE=minimal` always uses the
+A capture never writes `flake.lock`, from the copy or the project: it runs
+`nix develop --no-write-lock-file`, so a missing or incomplete lock is
+resolved in memory for that capture only, and a `nix flake update` run
+while a capture is going is kept (the next load captures again under the
+new lock). Lock the flake yourself (`nix flake lock`) to pin its inputs.
+`NDCE_FLAKE_SOURCE=minimal` always uses the
 copy, without checking; `tree` always uses the project. Set it per project
 in `.claude/settings.json` (`"env": {"NDCE_FLAKE_SOURCE": "tree"}`) or in
 `.envrc`.

@@ -1127,14 +1127,45 @@ two_projects() {
   grep -q "^nix develop $proj " "$STUB_NIX_LOG"
 }
 
-@test "source: a lock file the copy's capture updated is written back to the project" {
+@test "lock: a capture from the copy leaves the project's flake.lock alone" {
   locked_flake
   touch LOCK_UPDATE
   git add -A && git commit -q -m lock-update
   run ndce
   [ "$status" -eq 0 ]
-  [ "$(cat flake.lock)" = '{"updated": true}' ]
-  # Stored under the key of the updated lock file: the next call is a hit.
+  [ "$(cat flake.lock)" = '{}' ]
+  grep -q '^nix develop path:[^ ]* --no-write-lock-file ' "$STUB_NIX_LOG"
+  # The lock file is unchanged, so the next call is a hit.
   run ndce
   [ "$(nix_log_lines)" -eq 1 ]
+}
+
+@test "lock: a capture of a flake without a flake.lock does not create one" {
+  load_fixture flake-minimal
+  cd "$proj"
+  touch LOCK_UPDATE
+  git add -A && git commit -q -m lock-update
+  run ndce
+  [ "$status" -eq 0 ]
+  [ ! -e flake.lock ]
+  grep -q "^nix develop $proj --no-write-lock-file " "$STUB_NIX_LOG"
+  run ndce
+  [ "$(nix_log_lines)" -eq 1 ]
+}
+
+@test "lock: a flake.lock written while a capture runs is kept, and captured again" {
+  locked_flake
+  export STUB_NIX_SLEEP=1
+  ndce >"$BATS_TEST_TMPDIR/out" 2>"$BATS_TEST_TMPDIR/err" &
+  pid=$!
+  sleep 0.4
+  echo '{"updated by the user": true}' >flake.lock
+  wait "$pid"
+  [ "$(cat flake.lock)" = '{"updated by the user": true}' ]
+  # The capture used the old lock file, so it is not stored under the new
+  # one's key: the next call captures again.
+  unset STUB_NIX_SLEEP
+  run ndce
+  [ "$status" -eq 0 ]
+  [ "$(nix_log_lines)" -eq 2 ]
 }

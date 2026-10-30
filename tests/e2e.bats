@@ -2,7 +2,7 @@
 # End-to-end suite for nix-devshell-cached-exports, against REAL nix (no
 # stubs). Covers the same key scenarios as tests/unit.bats, run for real to
 # catch anything the stubbed sandbox suite can't (real nix stderr, real
-# flake.lock writes, real shellHooks). Skips cleanly if `nix` isn't
+# flake.lock handling, real shellHooks). Skips cleanly if `nix` isn't
 # installed. Each capture is ~5s, so this file keeps the capture count low:
 # see the comment on each @test.
 #
@@ -106,13 +106,16 @@ load_fixture() {
   [ "$(wc -l <"$proj/marker" | tr -d ' ')" -eq 2 ]
 }
 
-# 2 captures: the first writes flake.lock (from the project), the second
-# runs from a copy of the .nix files and the lock.
-@test "[e2e] a locked flake captures from a copy, and its devshell has a GC root" {
+# 2 captures: the first (from the project, which has no flake.lock) must not
+# write one; the second, once the flake is locked, runs from a copy of the
+# .nix files and the lock.
+@test "[e2e] a capture never writes flake.lock; a locked flake captures from a copy, with a GC root" {
   load_fixture flake-hook
   cd "$proj"
   run ndce
   [ "$status" -eq 0 ]
+  [ ! -e flake.lock ]
+  nix flake lock
   git add -A && git commit -q -m lock
 
   echo "# a no-op comment" >>flake.nix
