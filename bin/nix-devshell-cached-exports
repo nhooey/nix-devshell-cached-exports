@@ -828,8 +828,9 @@ still_capturing() {
 }
 
 if [[ -n $max_wait ]]; then
-  # A capture that rewrites flake.lock stores under a new key; it still
-  # repoints last-good, so a change of that link also means it finished.
+  # A capture whose files changed before it took the lock stores under
+  # another key; it still repoints last-good, so a change of that link also
+  # means it finished.
   last_good_before=$(readlink -- "$cache_dir/last-good" 2>/dev/null) || last_good_before=
   (PATH=$caller_path exec "$BASH" "$self" --dir "$root" </dev/null >/dev/null 2>&1 &)
   for ((tick = 0; tick < max_wait * 10; tick++)); do
@@ -1014,17 +1015,6 @@ parse_env0() {
 
 declare -A base_env=() dev_env=()
 
-# non_lock_hash : hashes the current `files` without any flake.lock.
-non_lock_hash() {
-  local f
-  local -a non_lock=()
-  for f in ${files[@]+"${files[@]}"}; do
-    [[ $f == flake.lock || $f == */flake.lock ]] || non_lock+=("$f")
-  done
-  hash_files ${non_lock[@]+"${non_lock[@]}"}
-}
-non_lock_hash
-pre_sig=$hash
 pre_key=$key
 
 # A flake's source: `nix develop` on the project copies all of it into the
@@ -1033,7 +1023,7 @@ pre_key=$key
 # the project itself is used when that copy fails to evaluate or the
 # devshell turns out to depend on it. Without a flake.lock, or with a path
 # literal reaching outside the project, the project itself is used straight
-# away, so that nix writes a new lock file there.
+# away.
 src_dir=
 if [[ $kind == flake && $flake_source != tree ]]; then
   use_copy=0
@@ -1065,10 +1055,16 @@ profile=$cache_dir/$pre_key.profile
 # capture SOURCE : runs the entry command, setting `capture_status`. The lock
 # fd is closed for it: anything the shell hook leaves running in the
 # background would otherwise hold the lock after we exit.
+#
+# A capture never writes flake.lock: it runs unasked, in the background, and
+# can take minutes, so a lock file it wrote would land over whatever the user
+# locked in the meantime. A missing or incomplete lock is resolved in memory
+# for the capture only, and locking stays with the user.
 capture() {
   if [[ $kind == flake ]]; then
     rm -f -- "$profile" "$profile"-*-link
-    entry=("$entry_bin" develop "$1" --profile "$profile" --command "$BASH" -c "$entry_script")
+    entry=("$entry_bin" develop "$1" --no-write-lock-file --profile "$profile"
+      --command "$BASH" -c "$entry_script")
   else
     entry=("$entry_bin" "$entry_file" --run "$entry_script")
   fi
@@ -1083,7 +1079,7 @@ capture() {
 # be told, it counts as used.
 copy_used() {
   local meta p src='' env_path requisites
-  meta=$(env -i -- ${base_args[@]+"${base_args[@]}"} "$entry_bin" flake metadata --json \
+  meta=$(env -i -- ${base_args[@]+"${base_args[@]}"} "$entry_bin" flake metadata --no-write-lock-file --json \
     "path:$src_dir" 2>/dev/null </dev/null {lock_fd}>&-) || return 0
   while IFS= read -r p; do
     p=${p#'"path":"'}
@@ -1302,21 +1298,13 @@ while [[ -n $rest ]]; do
   fi
 done
 
-# A capture of the copy that updated its flake.lock updates the project's,
-# as `nix develop` on the project would have.
-if [[ -n $src_dir && -f $src_dir/flake.lock ]] && ! cmp -s -- "$src_dir/flake.lock" flake.lock; then
-  cp -- "$src_dir/flake.lock" flake.lock || fail -m "could not update $root/flake.lock"
-fi
-
 # ---------------------------------------------------------------------------
-# Store under the post-capture key: a first `nix develop` may create or
-# rewrite flake.lock. If anything other than a flake.lock changed while the
-# capture ran, the capture may predate that edit, so it is stored under the
-# key it started from instead and the next call captures again.
+# Store under the key the capture started from. If a file in the key
+# changed while it ran (a `nix flake update`, say), the capture may predate
+# that edit, so the next call, under the new key, captures again.
 
 compute_key
-non_lock_hash
-if [[ $hash != "$pre_sig" ]]; then
+if [[ $key != "$pre_key" ]]; then
   key=$pre_key
   cache_file=$cache_dir/$key.sh
 fi
@@ -1339,16 +1327,6 @@ new_tmp last-good
 ln -sf -- "$key.sh" "$tmp"
 mv -f -- "$tmp" "$cache_dir/last-good"
 rm -f -- "$cache_dir/$key.failed" "$cache_dir/$pre_key.failed"
-
-# A capture stored under a new key (it rewrote flake.lock) roots the
-# devshell under that key too, so pruning keeps the root while the entry
-# lives. Best-effort: without it, a hit notices a collected devshell.
-if [[ $key != "$pre_key" && -L $profile ]]; then
-  if "${entry_bin%/*}/nix-store" --add-root "$cache_dir/$key.profile" \
-    --realise "$(readlink -f -- "$profile")" >/dev/null 2>&1; then
-    rm -f -- "$profile" "$profile"-*-link
-  fi
-fi
 
 # Prune: entries for old versions of the .nix files, their records, failure
 # markers and GC roots, and temp files a killed call left behind. Only a capture
