@@ -270,17 +270,17 @@ fi
 # An entry is the files named <key>.*, as the capture's prune judges them; a
 # <hash>.v3.deps record whose hash is not a key is an entry of its own, and
 # the newest of those is kept too. Never `.lock` or `last-good`. Adds to the
-# counters `pruned_entries`, `pruned_roots`, `pruned_files` and
-# `pruned_folders`.
+# counters `pruned_entries`, `pruned_roots`, `pruned_files`, `pruned_bytes`
+# and `pruned_folders`.
 prune_folder() {
-  local dir=$1 t name stem target newest='' newest_t=-1 newest_deps='' deps_t=-1
+  local dir=$1 t size name stem target newest='' newest_t=-1 newest_deps='' deps_t=-1
   local -A stem_t=() is_entry=() keep=()
   local -a names=() gone=()
   local -i entries=0
-  while IFS=' ' read -r -d '' t name; do
+  while IFS=' ' read -r -d '' t size name; do
     t=${t%.*}
     [[ $name != .lock && $name != last-good ]] || continue
-    names+=("$t $name")
+    names+=("$t $size $name")
     [[ $name != .* ]] || continue
     stem=${name%%.*}
     # (No ((a[$stem])): an arithmetic subscript would expand the name again.)
@@ -297,7 +297,7 @@ prune_folder() {
     if [[ $name == "$stem.sh" ]] && ((t > newest_t)); then
       newest=$stem newest_t=$t
     fi
-  done < <(find "$dir" -mindepth 1 -maxdepth 1 \( -type f -o -type l \) -printf '%T@ %f\0' 2>/dev/null)
+  done < <(find "$dir" -mindepth 1 -maxdepth 1 \( -type f -o -type l \) -printf '%T@ %s %f\0' 2>/dev/null)
 
   [[ -z $newest ]] || keep[$newest]=1
   [[ -z $newest_deps ]] || keep[$newest_deps]=1
@@ -315,12 +315,15 @@ prune_folder() {
   for name in ${names[@]+"${names[@]}"}; do
     t=${name%% *}
     name=${name#* }
+    size=${name%% *}
+    name=${name#* }
     if [[ $name == .* ]]; then
       ((t <= cutoff)) || continue
     else
       [[ -z ${keep[${name%%.*}]+set} ]] || continue
     fi
     gone+=("$dir/$name")
+    pruned_bytes+=size
     [[ $name != *.profile ]] || pruned_roots+=1
   done
   ((${#gone[@]})) || return 0
@@ -338,7 +341,7 @@ prune_folder() {
 # a capture holds is left alone: that capture prunes it itself.
 prune_all() {
   local base=$cache_base/$PROG folder fd
-  local -i pruned_entries=0 pruned_roots=0 pruned_files=0 pruned_folders=0 folders=0 busy=0
+  local -i pruned_entries=0 pruned_roots=0 pruned_files=0 pruned_bytes=0 pruned_folders=0 folders=0 busy=0
   local -i cutoff
   printf -v cutoff '%(%s)T' -1
   cutoff=$((cutoff - keep_days * 86400))
@@ -357,9 +360,12 @@ prune_all() {
     [[ -z ${fd-} ]] || exec {fd}>&-
     fd=
   done
-  printf '%s: %s %d entries and %d GC roots (%d files) in %d of %d project folders, keeping each one'"'"'s newest entry and those from the last %d days%s\n' \
+  # The size counts the cache's own files; the store paths a removed GC root
+  # held are freed only by the next garbage collection.
+  printf '%s: %s %d entries and %d GC roots (%d files, %s) in %d of %d project folders, keeping each one'"'"'s newest entry and those from the last %d days%s\n' \
     "$PROG" "$( ((dry_run)) && echo 'would remove' || echo removed)" \
-    "$pruned_entries" "$pruned_roots" "$pruned_files" "$pruned_folders" "$folders" "$keep_days" \
+    "$pruned_entries" "$pruned_roots" "$pruned_files" "$(numfmt --to=iec-i --suffix=B "$pruned_bytes")" \
+    "$pruned_folders" "$folders" "$keep_days" \
     "$( ((busy)) && echo "; skipped $busy folders it could not lock")"
 }
 
