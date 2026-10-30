@@ -98,78 +98,13 @@
 
             package = config.packages.default;
 
-            # The darwin module, evaluated with lib.evalModules against a stub
-            # of the one nix-darwin option it sets (launchd.user.agents),
-            # rather than against nix-darwin itself: that would add an input,
-            # and lock nodes, for every consumer of this flake for one check,
-            # and a whole darwin system evaluation per check run. The cost is
-            # that nix-darwin's own types for serviceConfig go unchecked
-            # here; the module sets only keys they document.
-            darwin-module =
-              let
-                inherit (pkgs) lib;
-                launchdStub = {
-                  options.launchd.user.agents = lib.mkOption {
-                    type = lib.types.attrsOf (
-                      lib.types.submodule {
-                        options.serviceConfig = lib.mkOption {
-                          type = lib.types.attrsOf lib.types.anything;
-                          default = { };
-                        };
-                      }
-                    );
-                    default = { };
-                  };
-                };
-                eval =
-                  settings:
-                  (lib.evalModules {
-                    modules = [
-                      launchdStub
-                      inputs.self.darwinModules.default
-                      { _module.args.pkgs = pkgs; }
-                      { services.nix-devshell-cached-exports.prune = settings; }
-                    ];
-                  }).config;
-                agentOf =
-                  settings: (eval settings).launchd.user.agents.nix-devshell-cached-exports-prune.serviceConfig;
-                agent = agentOf {
-                  enable = true;
-                  user = "alice";
-                };
-                tuned = agentOf {
-                  enable = true;
-                  user = "alice";
-                  keepDays = 3;
-                  interval = {
-                    Weekday = 6;
-                    Hour = 2;
-                  };
-                };
-                # (Without context: lib.hasInfix cannot match a store path.)
-                script = builtins.unsafeDiscardStringContext (builtins.elemAt agent.ProgramArguments 2);
-                exe = builtins.unsafeDiscardStringContext (lib.getExe config.packages.default);
-              in
-              assert (eval { }).launchd.user.agents == { };
-              assert
-                agent.StartCalendarInterval == [
-                  {
-                    Weekday = 7;
-                    Hour = 3;
-                    Minute = 0;
-                  }
-                ];
-              assert lib.hasInfix "${exe} --prune --keep-days 7" script;
-              assert lib.hasInfix "= alice ] || exit 0" script;
-              assert agent.EnvironmentVariables.HOME == "/Users/alice";
-              assert agent.StandardOutPath == "/Users/alice/Library/Logs/nix-devshell-cached-exports-prune.log";
-              assert lib.hasInfix "--prune --keep-days 3" (builtins.elemAt tuned.ProgramArguments 2);
-              assert
-                tuned.StartCalendarInterval == {
-                  Weekday = 6;
-                  Hour = 2;
-                };
-              pkgs.writeText "nix-devshell-cached-exports-darwin-module" (builtins.toJSON agent);
+            # The darwin module, evaluated against stubs of the nix-darwin
+            # options it reads and sets; see tests/darwin-module.nix.
+            darwin-module = import ./tests/darwin-module.nix {
+              inherit pkgs;
+              darwinModule = inputs.self.darwinModules.default;
+              package = config.packages.default;
+            };
           };
 
           treefmt = {

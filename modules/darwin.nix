@@ -20,9 +20,11 @@ let
       throw "services.nix-devshell-cached-exports.prune.user must name the user whose cache to prune";
 
   # The user's home: users.users.<user>.home when the configuration declares
-  # it, else the macOS default.
+  # it, else the macOS default. nix-darwin types that option as a path, and a
+  # configuration may set it unquoted, while launchd's EnvironmentVariables
+  # take only strings.
   declaredHome = config.users.users.${user}.home or null;
-  home = if declaredHome == null then "/Users/${user}" else declaredHome;
+  home = if declaredHome == null then "/Users/${user}" else toString declaredHome;
   logFile = "${home}/Library/Logs/nix-devshell-cached-exports-prune.log";
 
   # launchd loads a user agent for every user who logs in; only the cache's
