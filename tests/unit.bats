@@ -154,6 +154,150 @@ nix_log_lines() {
   [ "$status" -eq 0 ]
   eval "$output"
   [ "$FIXTURE_HOOK_PWD" = "$wt" ]
+  # The devshell doesn't declare its worktree hooks: no seed.
+  [ "$(nix_log_lines)" -eq 1 ]
+  [ -e "$wt/marker" ]
+}
+
+# Captures fixture $1 in $proj, then adds a worktree of it as $wt on
+# branch wt-branch, cd'd into.
+captured_with_worktree() {
+  load_fixture "$1"
+  cd "$proj"
+  run ndce
+  [ "$status" -eq 0 ]
+  [ "$(nix_log_lines)" -eq 1 ]
+  wt=$BATS_TEST_TMPDIR/worktree
+  git -C "$proj" worktree add -q "$wt" -b wt-branch
+  wt=$(cd -P "$wt" && pwd)
+  cd "$wt"
+}
+
+@test "a new worktree is seeded from a sibling's capture, root rewritten, worktree hook run" {
+  captured_with_worktree flake-worktree
+
+  run --separate-stderr ndce
+  [ "$status" -eq 0 ]
+  [ -z "$stderr" ]
+  [ "$(nix_log_lines)" -eq 1 ]
+  [[ $output == "# nix-devshell-cached-exports v3 root=$wt key="* ]]
+  [[ $output != *"$proj"* ]]
+  eval "$output"
+  [ "$FIXTURE_ROOT" = "$wt" ]
+  [ "$FIXTURE_DIRS" = "$wt/sub:$wt" ]
+  [ "$__NDCE_ROOT" = "$wt" ]
+  # The declared hook ran in the worktree; the rest of the startup didn't.
+  [ "$(cat "$wt/marker")" = hook ]
+  [ ! -e "$wt/startup" ]
+
+  # The seeded entry is this root's own: the next call is a hit.
+  rm "$wt/marker"
+  run ndce
+  [ "$status" -eq 0 ]
+  [ ! -e "$wt/marker" ]
+  [ "$(nix_log_lines)" -eq 1 ]
+  [ -L "$(dirname "$(ndce --print-cache-path)")/last-good" ]
+}
+
+@test "a seeded worktree gets its own GC root for the sibling's devshell" {
+  export NDCE_FLAKE_SOURCE=tree
+  captured_with_worktree flake-worktree
+  run ndce
+  [ "$status" -eq 0 ]
+  [ "$(nix_log_lines)" -eq 1 ]
+  key=$(ndce --print-key)
+  profile=$(dirname "$(ndce --print-cache-path)")/$key.profile
+  [ -L "$profile" ]
+  [ "$(readlink -f "$profile")" = "$proj" ]
+}
+
+@test "a seed leaves out the per-worktree build variables without worktrees on PATH" {
+  captured_with_worktree flake-worktree
+  run ndce
+  [ "$status" -eq 0 ]
+  [ "$(nix_log_lines)" -eq 1 ]
+  export CARGO_TARGET_DIR=/caller/target
+  eval "$output"
+  [ -z "${WORKTREE_BUILDS_WT+set}" ]
+  [ -z "${CARGO_TARGET_DIR+set}" ]
+  [ -z "${WORKTREE_BUILDS_SET+set}" ]
+}
+
+@test "a seed takes the per-worktree build variables from worktrees env" {
+  mkdir -p "$BATS_TEST_TMPDIR/bin"
+  cat >"$BATS_TEST_TMPDIR/bin/worktrees" <<'EOF'
+#!/usr/bin/env bash
+[ "$1 $2 $3" = "env --shell sh" ] || exit 64
+id=${PWD##*/}-$(printf '%s' "$PWD" | sha256sum | cut -c1-8)
+echo "worktrees env in $PWD" >>"$HOME/worktrees.log"
+printf "export WORKTREE_BUILDS_WT='%s'\n" "$HOME/builds/wt/$id"
+printf "export CARGO_TARGET_DIR='%s'\n" "$HOME/builds/wt/$id/target"
+printf "export WORKTREE_BUILDS_SET='CARGO_TARGET_DIR WORKTREE_BUILDS_WT'\n"
+EOF
+  chmod +x "$BATS_TEST_TMPDIR/bin/worktrees"
+  export PATH=$BATS_TEST_TMPDIR/bin:$PATH
+  captured_with_worktree flake-worktree
+  main_target=$(printf '%s' "$proj" | sha256sum | cut -c1-8)
+  wt_target=$HOME/builds/wt/worktree-$(printf '%s' "$wt" | sha256sum | cut -c1-8)/target
+
+  run ndce
+  [ "$status" -eq 0 ]
+  [ "$(nix_log_lines)" -eq 1 ]
+  [ "$(cat "$HOME/worktrees.log")" = "worktrees env in $wt" ]
+  eval "$output"
+  [ "$CARGO_TARGET_DIR" = "$wt_target" ]
+  [[ $CARGO_TARGET_DIR != *"$main_target"* ]]
+  [ "$WORKTREE_BUILDS_WT" = "${wt_target%/target}" ]
+}
+
+@test "no seed when the sibling's capture holds its root other than as a path prefix" {
+  load_fixture flake-worktree
+  touch "$proj/ODD_ROOT"
+  cd "$proj"
+  run ndce
+  [ "$status" -eq 0 ]
+  [[ $output == *"$proj-odd"* ]]
+  wt=$BATS_TEST_TMPDIR/worktree
+  git -C "$proj" worktree add -q "$wt" -b wt-branch
+  wt=$(cd -P "$wt" && pwd)
+  cd "$wt"
+
+  run ndce
+  [ "$status" -eq 0 ]
+  [ "$(nix_log_lines)" -eq 2 ]
+  [ -e "$wt/startup" ]
+  eval "$output"
+  [ "$FIXTURE_ROOT" = "$wt" ]
+  [ -z "${FIXTURE_ODD+set}" ]
+}
+
+@test "no seed for a worktree whose flake.nix differs" {
+  captured_with_worktree flake-worktree
+  echo "# changed in the worktree" >>"$wt/flake.nix"
+  git -C "$wt" commit -q -am "change flake.nix"
+
+  run ndce
+  [ "$status" -eq 0 ]
+  [ "$(nix_log_lines)" -eq 2 ]
+  [ -e "$wt/startup" ]
+}
+
+@test "a failing worktree hook after a seed falls back to a full capture" {
+  captured_with_worktree flake-worktree
+  # The hook appends to marker; a directory there makes it fail.
+  mkdir "$wt/marker"
+
+  run --separate-stderr ndce
+  [ "$(nix_log_lines)" -eq 2 ]
+  [[ $stderr == *"worktree hooks failed"* ]]
+}
+
+@test "--refresh in a new worktree captures in full rather than seeding" {
+  captured_with_worktree flake-worktree
+  run ndce --refresh
+  [ "$status" -eq 0 ]
+  [ "$(nix_log_lines)" -eq 2 ]
+  [ -e "$wt/startup" ]
 }
 
 @test "TMPDIR TMP TEMP TEMPDIR survive eval unchanged" {

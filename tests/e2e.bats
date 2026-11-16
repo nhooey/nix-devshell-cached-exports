@@ -175,6 +175,29 @@ load_fixture() {
   [ "$FIXTURE_HOOK_PWD" = "$wt" ]
 }
 
+@test "[e2e] a new worktree is seeded from its sibling's capture, then forgotten" {
+  load_fixture flake-worktree
+  cd "$proj"
+  run ndce
+  [ "$status" -eq 0 ]
+
+  wt=$BATS_TEST_TMPDIR/worktree
+  git -C "$proj" worktree add -q "$wt" -b wt-branch
+  wt=$(cd -P "$wt" && pwd)
+  cd "$wt"
+
+  run --separate-stderr ndce
+  [ "$status" -eq 0 ]
+  [ -z "$stderr" ]
+  eval "$output"
+  [ "$FIXTURE_ROOT" = "$wt" ]
+  [ -z "${CARGO_TARGET_DIR+set}" ]
+  [ "$(cat "$wt/marker")" = hook ]
+  [ ! -e "$wt/startup" ]
+  folder=$(dirname "$(ndce --print-cache-path)")
+  [ -e "$folder/$(ndce --print-key).profile" ]
+}
+
 @test "[e2e] TMPDIR TMP TEMP TEMPDIR survive eval unchanged" {
   load_fixture flake-minimal
   cd "$proj"

@@ -128,7 +128,10 @@ install it and otherwise does nothing.
     [Finding the checkout at run time](#finding-the-checkout-at-run-time).
 - **The first load in a new directory waits.** A new worktree has its own
   cache, so the first command or `cd` there waits up to 10 seconds for a
-  capture, and the devshell's shell hooks run there.
+  capture, and the devshell's shell hooks run there. A devshell that
+  declares its worktree hooks is seeded from a sibling worktree instead,
+  and waits only for those hooks. See
+  [A new worktree](#a-new-worktree).
 - **Shell hooks run once per capture.** A hook that must run for every
   command, such as one that fetches a short-lived secret or syncs files,
   does not fit. Neither does timing each command.
@@ -349,6 +352,40 @@ The scan prefers including too much: an extra file only costs a capture
 when it changes. A cache hit doesn't scan. It reads the recorded list,
 usually empty, and hashes those files.
 
+### A new worktree
+
+The key holds no path, so another worktree of the same clone (as
+`git worktree list` names them) with an entry for the same key has already
+captured the same devshell. On a miss, the first such entry that passes
+these checks is copied, with its root replaced by the new one, instead of a
+capture:
+
+- **The devshell declares its worktree hooks** by exporting
+  `NDCE_WORKTREE_HOOK`: shell code for what its startup does inside the
+  root, such as linking `.agents/skills/`, or an empty value for nothing.
+  The rest of its startup counts as setting the environment, which the copy
+  already holds. The hook runs in the new root with the copied environment
+  loaded. A devshell that doesn't declare it is captured in full, since its
+  hooks may act inside the root. If the hook fails, so does the seed, and a
+  full capture follows.
+- **The old root appears only as a path prefix:** after a quote, `:`, `=`,
+  a space or a newline, and before `/`, a quote, `:`, a space or a newline.
+  A value that holds it some other way, inside a longer name or a word,
+  can't be rewritten safely, so the new root is captured in full. A value
+  derived from the root without holding it, such as a hash of it, isn't
+  caught by this check.
+- **The per-worktree build variables are left out.** Those that
+  `worktrees env` names in `WORKTREE_BUILDS_SET`, with
+  `WORKTREE_BUILDS_WT` and `WORKTREE_BUILDS_SET` itself, end in a hash of
+  the worktree's path. The copy unsets them, and when `worktrees` is on the
+  `PATH`, runs `worktrees env --shell sh` in the new root for its own, so a
+  seeded worktree never builds into its sibling's folder.
+- **The entry is live,** its devshell still in the store, and names its own
+  root. The seeded root gets its own GC root for that devshell.
+
+`--refresh` never seeds. A seeded entry is the new root's own from then on:
+the next load is a hit, and a change to the `.nix` files captures in full.
+
 ### Pruning
 
 Each successful capture deletes the project's cache files not written for
@@ -537,6 +574,32 @@ start-up included:
 | cached, from a subdirectory | 0.023 s |
 | cached, from a worktree | 0.026 s |
 | computing the cache key alone (`--print-key`) | 0.026 s |
+
+A new worktree's first load, on 2026-11-17 (Apple Silicon, Nix 2.34.9),
+in three repositories whose numtide/devshell flakes have the skills
+reconcile as their one startup hook. The main checkout had a capture for
+the same key. The machine's load average was 17–36 on 12 cores, so the
+times are 2–3 times what an idle machine gives; compare the rows, not the
+numbers. Steps after the first capture ran 3 times, and the fastest
+counts:
+
+| Load | writing-skills | dendrometer | github-config |
+|---|---:|---:|---:|
+| full capture, the worktree's first | 35.4 s | 42.7 s | 13.6 s |
+| … of which `nix develop` | 31.6 s | 40.5 s | 12.2 s |
+| `nix print-dev-env`: evaluation and build, evaluation cache warm | 0.65 s | 1.33 s | 1.09 s |
+| the startup hook (the skills reconcile) | 7.7 s | 11.5 s | 5.3 s |
+| seeded from a sibling, the reconcile as its worktree hook | 11.1 s | 10.9 s | 4.7 s |
+| the reconcile alone, run again | 6.9 s | 7.4 s | 3.4 s |
+| the next load, a hit | 0.19 s | 0.13 s | 0.11 s |
+
+Most of a full capture is `nix develop` beyond its startup hook: evaluating
+and building from the copy of the flake's files (see
+[Store copies](#store-copies-gc-roots-and-secrets)). On the checkout itself,
+with the evaluation cache warm, the same takes about a second; why the copy
+costs so much more wasn't measured. A seed skips evaluation, the build and
+every hook but the worktree's own, which leaves the reconcile as nearly all
+of a seeded load.
 
 ## Verified in Claude Code
 

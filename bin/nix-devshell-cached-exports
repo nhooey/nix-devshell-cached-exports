@@ -601,6 +601,14 @@ if [[ $mode == prune ]]; then
   exit 0
 fi
 
+# root_folder PATH : sets `folder` to the cache folder of the project root
+# PATH, an absolute path as the capture records it (symlinks resolved).
+root_folder() {
+  local sum
+  sum=$(printf '%s' "$1" | sha256sum) || die "sha256sum failed"
+  folder=$cache_base/$PROG/${sum:0:16}
+}
+
 if [[ $mode == print-defaults ]]; then
   cat -- "$defaults_file"
   exit 0
@@ -1197,6 +1205,146 @@ entry_bin=$(PATH=$base_path type -P "$entry_cmd") ||
   entry_bin=$(type -P "$entry_cmd") ||
   fail -m "$entry_cmd not found on PATH"
 env_bin=$(type -P env) || fail -m "env not found on PATH"
+
+# ---------------------------------------------------------------------------
+# Seed from a sibling worktree. The key holds no path, so another worktree
+# of this clone with an entry for the same key has captured the same
+# devshell. Its entry, with its root replaced by this one, stands in for a
+# capture (Nix's evaluation, its build and the shell hooks), and only the
+# hooks that act inside the root run here.
+#
+# The devshell says which hooks those are by exporting NDCE_WORKTREE_HOOK,
+# shell code run in the root with the devshell's environment (empty for
+# none). One that doesn't say is captured in full, since its hooks may act
+# inside the root.
+
+readonly WORKTREE_HOOK_VAR=NDCE_WORKTREE_HOOK
+# Variables `worktrees env` sets, named in WORKTREE_BUILDS_SET, hold a hash
+# of the worktree's path rather than the path, so a rewrite can't fix them.
+readonly BUILDS_SET_VAR=WORKTREE_BUILDS_SET
+readonly -a BUILDS_ALWAYS=(WORKTREE_BUILDS_SET WORKTREE_BUILDS_WT)
+
+# prefix_only TEXT OLD : whether every occurrence of OLD in TEXT is a whole
+# path or a path's leading directories: after a quote, `:`, `=`, a space or
+# a newline, and before `/`, a quote, `:`, a space or a newline. Any other
+# occurrence (a longer name, the root inside a word) could mean something a
+# rewrite gets wrong.
+prefix_only() {
+  local rest=$1 old=$2 before
+  local -r starts=$'\'":= \n' ends=$'/\'": \n'
+  while [[ $rest == *"$old"* ]]; do
+    before=${rest%%"$old"*}
+    rest=${rest#*"$old"}
+    [[ -n $before && $starts == *"${before: -1}"* ]] || return 1
+    [[ -z $rest || $ends == *"${rest:0:1}"* ]] || return 1
+  done
+}
+
+# find_seed : sets `seed_root`, `seed_folder` and `seed_text` from the first
+# other worktree of this clone whose entry for the current key is live,
+# names its root, declares its worktree hooks and holds its root only as a
+# path prefix; returns 1 if none does.
+find_seed() {
+  local rel=${root#"$git_top"} line path folder text header
+  local -a lines=()
+  [[ $root != *[\'\\$'\n']* ]] || return 1
+  mapfile -d '' lines < <(git -C "$root" worktree list --porcelain -z 2>/dev/null)
+  for line in ${lines[@]+"${lines[@]}"}; do
+    [[ $line == 'worktree '?* ]] || continue
+    path=$(cd -P -- "${line#worktree }$rel" 2>/dev/null && pwd) || continue
+    [[ $path != "$root" && $path != *[\'\\$'\n']* ]] || continue
+    root_folder "$path"
+    [[ -s $folder/$key.sh ]] || continue
+    text=
+    IFS= read -r -d '' text <"$folder/$key.sh" || [[ -n $text ]] || continue
+    header=${text%%$'\n'*}
+    [[ $header == "# $PROG v3 root=$path key=$key" || $header == "# $PROG v3 root=$path key=$key store="* ]] || continue
+    live "$header" || continue
+    [[ $text == *$'\n'"export $WORKTREE_HOOK_VAR="* ]] || continue
+    prefix_only "$text" "$path" || continue
+    seed_root=$path seed_folder=$folder seed_text=$text
+    return 0
+  done
+  return 1
+}
+
+# insert_before_tail TEXT CODE : sets `seeded` to TEXT with CODE inserted
+# before its last two lines, which record the root and the variables set.
+insert_before_tail() {
+  local head=${1%$'\n'"export __NDCE_ROOT="*}
+  seeded=$head$'\n'$2${1:${#head}+1}
+}
+
+# The seed's run in the new root: load the seeded entry, recompute the
+# per-worktree build variables if the sibling had them and `worktrees` is
+# on the PATH, then run the worktree hooks.
+# shellcheck disable=SC2016 # single quotes intended: run by the bash below
+readonly SEED_SCRIPT='. "$1" || exit
+if [ -n "$3" ] && command -v worktrees >/dev/null 2>&1; then
+  worktrees env --shell sh >"$2" || exit
+  . "$2" || exit
+fi
+eval "${'"$WORKTREE_HOOK_VAR"'-}"'
+
+# seed : writes and prints the current key's entry from a sibling's, and
+# exits 0; returns 1 when there is none to use or the worktree hooks fail,
+# for a full capture to follow.
+seed() {
+  local seed_root seed_folder seed_text seeded names builds='' re name env_path q="'"
+  local -a set_names=()
+  find_seed || return 1
+  seeded=${seed_text//"$seed_root"/"$root"}
+
+  re=$'\n'"export $BUILDS_SET_VAR=$q([^$q]*)$q"$'\n'
+  if [[ $seeded =~ $re ]]; then
+    builds=1
+    read -r -a set_names <<<"${BASH_REMATCH[1]}" || true
+    names="${BUILDS_ALWAYS[*]}"
+    for name in ${set_names[@]+"${set_names[@]}"}; do
+      is_ident "$name" && names+=" $name"
+    done
+    insert_before_tail "$seeded" "unset $names"$'\n'
+  fi
+
+  new_tmp seed
+  local entry_tmp=$tmp
+  new_tmp seed-builds
+  local builds_tmp=$tmp
+  new_tmp seed-err
+  local err_tmp=$tmp
+  printf '%s' "$seeded" >"$entry_tmp"
+  env -i -- ${base_args[@]+"${base_args[@]}"} "$BASH" -c "$SEED_SCRIPT" ndce-seed \
+    "$entry_tmp" "$builds_tmp" "$builds" </dev/null >/dev/null 2>"$err_tmp" {lock_fd}>&- || {
+    printf '%s: in %s, the worktree hooks failed after seeding from %s; capturing in full:\n' \
+      "$PROG" "$root" "$seed_root" >&2
+    tail -n "$FAILED_TAIL_LINES" -- "$err_tmp" >&2 || true
+    return 1
+  }
+  if [[ -s $builds_tmp ]]; then
+    insert_before_tail "$seeded" "$(<"$builds_tmp")"$'\n'
+    printf '%s' "$seeded" >"$entry_tmp"
+  fi
+
+  # The sibling's GC root keeps the devshell only while the sibling's entry
+  # lasts; this root gets its own (best-effort: the store-path check on
+  # each load turns a collected devshell into a capture).
+  if env_path=$(readlink -f -- "$seed_folder/$key.profile" 2>/dev/null) && [[ -e $env_path ]]; then
+    env -i -- ${base_args[@]+"${base_args[@]}"} "${entry_bin%/*}/nix-store" \
+      --add-root "$cache_dir/$key.profile" --realise "$env_path" \
+      </dev/null >/dev/null 2>&1 {lock_fd}>&- || true
+  fi
+
+  mv -f -- "$entry_tmp" "$cache_file"
+  new_tmp last-good
+  ln -sf -- "$key.sh" "$tmp"
+  mv -f -- "$tmp" "$cache_dir/last-good"
+  printf '%s' "$seeded"
+  exit 0
+}
+
+if ((! refresh)) && ((in_git)); then
+  seed || true
+fi
 
 new_tmp baseline
 baseline_file=$tmp
