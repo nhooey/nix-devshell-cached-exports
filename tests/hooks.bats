@@ -132,7 +132,7 @@ cd() { builtin cd "$@" || return; command -v nix-devshell-cached-exports >/dev/n
 # Claude Code fetches a plugin again only when its version changes, so a
 # hook change without a bump never reaches anyone who already installed it.
 # scripts/bump-plugin-version explains this and sets both versions.
-NEEDS_BUMP="run scripts/bump-plugin-version (see its header for why)"
+NEEDS_BUMP="run ndce-dev bump-plugin-version (see scripts/bump-plugin-version for why)"
 
 @test "plugin.json and marketplace.json give the plugin the same version" {
   v=$(grep -oE '"version": *"[^"]*"' "$REPO_ROOT/.claude-plugin/plugin.json")
