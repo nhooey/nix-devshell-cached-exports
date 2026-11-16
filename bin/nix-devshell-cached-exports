@@ -46,6 +46,7 @@ Usage: $PROG [export] [--dir PATH] [--refresh | --max-wait SECONDS] [--format ba
        $PROG --print-key [--dir PATH]
        $PROG --print-cache-path [--dir PATH]
        $PROG --prune [--keep-days N] [--dry-run]
+       $PROG --forget ROOT [--dry-run]
        $PROG --print-config | --print-defaults
        $PROG -h | --help
 
@@ -66,7 +67,10 @@ from a cache keyed on the files that define the devshell:
   --prune             in every project's cache folder, delete the entries (and
                       their GC roots) but the newest and those written within
                       --keep-days N days (default: $PRUNE_KEEP_DAYS)
-  --dry-run           with --prune, print what would go and delete nothing
+  --forget ROOT       delete the cache folder of one project root, such as a
+                      worktree being removed, with its entries and GC roots
+  --dry-run           with --prune or --forget, print what would go and
+                      delete nothing
   --print-config      print the settings in effect, each with where it came
                       from: the shipped defaults, the user's config file
                       ($user_config_file)
@@ -388,6 +392,7 @@ refresh=0
 max_wait=
 keep_days=
 dry_run=0
+forget_root=
 
 set_mode() {
   if [[ -n $mode && $mode != "$1" ]]; then
@@ -437,6 +442,17 @@ while (($#)); do
   --print-config) set_mode print-config ;;
   --print-defaults) set_mode print-defaults ;;
   --prune) set_mode prune ;;
+  --forget)
+    (($# >= 2)) && [[ -n $2 ]] || usage_error "--forget needs a project root"
+    set_mode forget
+    forget_root=$2
+    shift
+    ;;
+  --forget=*)
+    set_mode forget
+    forget_root=${1#--forget=}
+    [[ -n $forget_root ]] || usage_error "--forget needs a project root"
+    ;;
   --keep-days)
     (($# >= 2)) || usage_error "--keep-days needs a number of days"
     keep_days=$2
@@ -468,8 +484,11 @@ if [[ $mode == prune ]]; then
   keep_days=${keep_days:-$PRUNE_KEEP_DAYS}
   [[ $keep_days != *[!0123456789]* && ${#keep_days} -le 5 ]] ||
     usage_error "--keep-days needs a number of days: $keep_days"
+elif [[ $mode == forget ]]; then
+  ((! dir_given && ! refresh)) && [[ -z $max_wait && -z $keep_days ]] ||
+    usage_error "--forget cannot be combined with --dir, --refresh, --max-wait or --keep-days"
 elif [[ -n $keep_days ]] || ((dry_run)); then
-  usage_error "--keep-days and --dry-run need --prune"
+  usage_error "--keep-days needs --prune, and --dry-run --prune or --forget"
 fi
 
 if [[ $mode == print-config || $mode == print-defaults ]]; then
@@ -601,6 +620,11 @@ if [[ $mode == prune ]]; then
   exit 0
 fi
 
+# ---------------------------------------------------------------------------
+# --forget: a removed worktree's cache folder is otherwise only emptied by
+# age, one entry at a time, and the folder itself stays. Whatever removes a
+# worktree (`worktrees finish`) calls this for its root.
+
 # root_folder PATH : sets `folder` to the cache folder of the project root
 # PATH, an absolute path as the capture records it (symlinks resolved).
 root_folder() {
@@ -608,6 +632,41 @@ root_folder() {
   sum=$(printf '%s' "$1" | sha256sum) || die "sha256sum failed"
   folder=$cache_base/$PROG/${sum:0:16}
 }
+
+# forget ROOT : deletes ROOT's cache folder, or with --dry-run prints its
+# files. ROOT may already be gone, as a removed worktree is: then it is taken
+# as written, so it must be the real path, without symlinks.
+forget() {
+  local path=$1 folder fd
+  [[ $path == /* ]] || path=$PWD/$path
+  if [[ -d $path ]]; then
+    path=$(cd -P -- "$path" && pwd) || die "cannot resolve $1"
+  else
+    while [[ $path == */ && $path != / ]]; do path=${path%/}; done
+  fi
+  root_folder "$path"
+  if [[ ! -d $folder || -L $folder ]]; then
+    printf '%s: nothing cached for %s\n' "$PROG" "$path" >&2
+    return 0
+  fi
+  if ((dry_run)); then
+    find "$folder" -mindepth 1 -maxdepth 1 -print | LC_ALL=C sort
+    return 0
+  fi
+  # A capture of this root holds the lock; its entry would land in a folder
+  # being deleted.
+  exec {fd}>>"$folder/.lock" || die "cannot open $folder/.lock"
+  flock -n "$fd" || die "a capture of $path is running; run --forget again once it finishes"
+  rm -rf -- "$folder"
+  exec {fd}>&-
+  printf '%s: forgot %s (%s)\n' "$PROG" "$path" "$folder" >&2
+}
+
+if [[ $mode == forget ]]; then
+  [[ -n $cache_base ]] || die "cannot locate the cache: neither XDG_CACHE_HOME nor HOME is set"
+  forget "$forget_root"
+  exit 0
+fi
 
 if [[ $mode == print-defaults ]]; then
   cat -- "$defaults_file"

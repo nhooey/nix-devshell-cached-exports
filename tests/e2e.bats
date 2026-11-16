@@ -196,6 +196,11 @@ load_fixture() {
   [ ! -e "$wt/startup" ]
   folder=$(dirname "$(ndce --print-cache-path)")
   [ -e "$folder/$(ndce --print-key).profile" ]
+
+  cd "$proj"
+  run ndce --forget "$wt"
+  [ "$status" -eq 0 ]
+  [ ! -e "$folder" ]
 }
 
 @test "[e2e] TMPDIR TMP TEMP TEMPDIR survive eval unchanged" {
