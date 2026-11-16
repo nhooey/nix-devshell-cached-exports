@@ -1226,6 +1226,13 @@ write_user_config() {
   [[ $output == *'secret-vars = ["A", "B"]  # environment: NDCE_SECRET_VARS'* ]]
 }
 
+@test "config: a list's comma may start the next line" {
+  write_user_config 'exclude = ["A"' '  , "B"' '  ,]'
+  run --separate-stderr ndce --print-config
+  [ "$status" -eq 0 ]
+  [[ $output == *"exclude = [\"A\", \"B\"]  # user: $user_config"* ]]
+}
+
 @test "config: an unknown key, a wrong kind or value, or a key set twice is refused" {
   write_user_config 'flake_sourc = "tree"'
   run --separate-stderr ndce --print-config
