@@ -506,30 +506,23 @@ start-up included:
 | cached, from a worktree | 0.026 s |
 | computing the cache key alone (`--print-key`) | 0.026 s |
 
-An earlier prototype measured `nix develop --command true` at 3.6 s on
-another numtide/devshell project, against 0.032–0.037 s for a cached load.
-
 ## Verified in Claude Code
 
-From headless runs (`claude --plugin-dir <this repo> --model haiku -p …`):
+Headless runs (`claude --plugin-dir <this repo> --model haiku -p …`), with
+the plugin and command loaded both from a checkout and from GitHub, show:
 
-- **2026-09-26, Claude Code 2.1.282:**
-  - A plugin's `SessionStart` hook receives `CLAUDE_ENV_FILE`, and Claude
-    Code runs that file before every Bash command, not once per session.
-  - In a flake project whose shell hook writes a line to a marker file, the
-    first Bash command already had the devshell, and the hook had run once.
-    After `flake.nix` was edited, the next command had the change, with no
-    restart, and the hook had run twice: one capture per change.
-  - A subagent's Bash commands had the same devshell.
-- **2026-09-27:** the same runs with the plugin and command installed from
-  GitHub gave the same results.
-- **2026-10-04, plugin 0.3.0:**
-  - The `PreToolUse` reminder reached the model after `nix develop -c true`.
-  - The `SubagentStart` context reached a general-purpose subagent.
-  - `nix-devshell-cached-exports:worktree-worker` ran in a new worktree on
-    its own branch, with `__NDCE_ROOT` set to that worktree and the
-    devshell's tools on `PATH`. The unchanged worktree was removed
-    afterwards.
+- A plugin's `SessionStart` hook receives `CLAUDE_ENV_FILE`, and Claude
+  Code runs that file before every Bash command, not once per session.
+- In a flake project whose shell hook writes a line to a marker file, the
+  first Bash command already has the devshell, and the hook has run once.
+  After `flake.nix` is edited, the next command has the change, with no
+  restart, and the hook has run twice: one capture per change.
+- A subagent's Bash commands have the same devshell.
+- The `PreToolUse` reminder reaches the model after `nix develop -c true`.
+- The `SubagentStart` context reaches a general-purpose subagent.
+- `nix-devshell-cached-exports:worktree-worker` runs in a new worktree on
+  its own branch, with `__NDCE_ROOT` set to that worktree and the
+  devshell's tools on `PATH`. An unchanged worktree is removed afterwards.
 - `claude plugin validate` passes. Its one warning, that `CLAUDE.md` at the
   repository root isn't loaded as plugin context, is expected: that file is
   for agents working on this repository.
