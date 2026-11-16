@@ -193,6 +193,7 @@ nix-devshell-cached-exports [export] [--dir PATH] [--refresh | --max-wait SECOND
 nix-devshell-cached-exports --print-key [--dir PATH]
 nix-devshell-cached-exports --print-cache-path [--dir PATH]
 nix-devshell-cached-exports --prune [--keep-days N] [--dry-run]
+nix-devshell-cached-exports --forget ROOT [--dry-run]
 nix-devshell-cached-exports --print-config | --print-defaults
 nix-devshell-cached-exports -h | --help
 ```
@@ -211,6 +212,8 @@ nix-devshell-cached-exports -h | --help
 - `--prune` sweeps the cache folders of every project, not only the current one's (see [Pruning](#pruning)).
   `--keep-days N` (default 7) sets how recent an entry must be to stay; `--dry-run` prints the paths it would delete and deletes nothing.
   It ends with a one-line summary.
+- `--forget ROOT` deletes the cache folder of one project root, such as a worktree being removed, with its entries and GC roots (see [A new worktree](#a-new-worktree)).
+  `--dry-run` lists the folder's files instead.
 - `--print-config` prints the settings in effect, each with where it came from; `--print-defaults` prints the shipped defaults file (see [Settings](#settings)).
 - Outside a Nix project (no `flake.nix`, `shell.nix` or `default.nix` in the directory or above it), it prints nothing and exits 0, so it's safe to call anywhere.
 
@@ -311,6 +314,10 @@ On a miss, the first such entry that passes these checks is copied, with its roo
 `--refresh` never seeds.
 A seeded entry is the new root's own from then on: the next load is a hit, and a change to the `.nix` files captures in full.
 
+Whatever removes a worktree can remove its cache folder too, with `nix-devshell-cached-exports --forget <root>`.
+It takes the folder's lock without waiting and refuses while a capture holds it.
+A root already gone from disk is taken as written, so pass the real path, without symlinks.
+
 ### Pruning
 
 Each successful capture deletes the project's cache files not written for 30 days, other than the new entry, `last-good` and `.lock`.
@@ -336,7 +343,7 @@ $ nix-devshell-cached-exports --prune --dry-run | tail -n 1
 nix-devshell-cached-exports: would remove 673 entries and 517 GC roots (2220 files) in 181 of 575 project folders, keeping each one's newest entry and those from the last 7 days
 ```
 
-The folder of a deleted project keeps its newest entry; remove the folder by hand.
+The folder of a deleted project keeps its newest entry; remove it with `--forget ROOT`.
 
 **On a schedule (nix-darwin).** The flake exports a module that runs it weekly from a launchd user agent:
 

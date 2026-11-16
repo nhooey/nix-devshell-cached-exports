@@ -567,6 +567,44 @@ EOF
   [ -e "$wt/startup" ]
 }
 
+@test "--forget deletes one root's cache folder, and only that one" {
+  captured_with_worktree flake-worktree
+  run ndce
+  [ "$status" -eq 0 ]
+  wt_folder=$(dirname "$(ndce --print-cache-path)")
+  main_folder=$(dirname "$(ndce --dir "$proj" --print-cache-path)")
+  [ -d "$wt_folder" ] && [ -d "$main_folder" ]
+
+  run ndce --forget "$wt" --dry-run
+  [ "$status" -eq 0 ]
+  [[ $output == *"$wt_folder/last-good"* ]]
+  [ -d "$wt_folder" ]
+
+  cd "$BATS_TEST_TMPDIR"
+  git -C "$proj" worktree remove --force "$wt"
+  # Gone from disk, the root is taken as written.
+  run --separate-stderr ndce --forget "$wt/"
+  [ "$status" -eq 0 ]
+  [[ $stderr == *"forgot $wt "* ]]
+  [ ! -e "$wt_folder" ]
+  [ -d "$main_folder" ]
+
+  run --separate-stderr ndce --forget "$wt"
+  [ "$status" -eq 0 ]
+  [[ $stderr == *"nothing cached for $wt"* ]]
+}
+
+@test "--forget usage errors" {
+  run ndce --forget
+  [ "$status" -eq 2 ]
+  run ndce --forget /x --refresh
+  [ "$status" -eq 2 ]
+  run ndce --forget /x --keep-days 3
+  [ "$status" -eq 2 ]
+  run ndce --forget /x --prune
+  [ "$status" -eq 2 ]
+}
+
 @test "TMPDIR TMP TEMP TEMPDIR survive eval unchanged" {
   load_fixture flake-minimal
   cd "$proj"
