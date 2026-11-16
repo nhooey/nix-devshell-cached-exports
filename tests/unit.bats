@@ -26,6 +26,8 @@ setup() {
   export HOME=$home
   export XDG_CACHE_HOME=$BATS_TEST_TMPDIR/cache
   mkdir -p "$XDG_CACHE_HOME"
+  export XDG_CONFIG_HOME=$BATS_TEST_TMPDIR/config
+  user_config=$XDG_CONFIG_HOME/nix-devshell-cached-exports/config.toml
 
   export STUB_NIX_LOG=$BATS_TEST_TMPDIR/stub-nix.log
   : >"$STUB_NIX_LOG"
@@ -368,25 +370,6 @@ nix_log_lines() {
   [ "$status2" -eq 0 ]
   diff "$BATS_TEST_TMPDIR/out1" "$BATS_TEST_TMPDIR/out2"
   [ "$(nix_log_lines)" -eq 1 ]
-}
-
-@test "timing: cached load, reported not asserted" {
-  load_fixture flake-minimal
-  cd "$proj"
-
-  run ndce
-  [ "$status" -eq 0 ]
-
-  iterations=20
-  # GNU date (coreutils) for nanoseconds; macOS /bin/date has no %N.
-  start_ns=$(date +%s%N)
-  for _ in $(seq 1 "$iterations"); do
-    eval "$(ndce)"
-  done
-  end_ns=$(date +%s%N)
-
-  us_per_load=$(((end_ns - start_ns) / iterations / 1000))
-  echo "# cached load + eval: ${us_per_load} us/iteration over ${iterations} iterations" >&3
 }
 
 # Replaces the loaded fixture's stub-env.sh with $1 and commits it.
@@ -966,7 +949,7 @@ fake_store() {
   [ "$status" -eq 0 ]
   [[ $output == *"KEEP_ME"* ]]
   [[ $output != *tok-value* && $output != *pw-value* ]]
-  [[ $stderr == *"left out of the cache by NDCE_SECRET_VARS, so not set: HF_TOKEN MY_Password."* ]]
+  [[ $stderr == *"left out of the cache by secret-vars (environment: NDCE_SECRET_VARS), so not set: HF_TOKEN MY_Password."* ]]
   run ndce --print-cache-path
   ! grep -q -e tok-value -e pw-value "$output"
 }
@@ -1173,4 +1156,134 @@ two_projects() {
   run ndce
   [ "$status" -eq 0 ]
   [ "$(nix_log_lines)" -eq 2 ]
+}
+
+# ---------------------------------------------------------------------------
+# Settings
+
+defaults_toml() {
+  cat "$repo/share/nix-devshell-cached-exports/defaults.toml"
+}
+
+write_user_config() {
+  mkdir -p "${user_config%/*}"
+  printf '%s\n' "$@" >"$user_config"
+}
+
+@test "config: the defaults file names every setting the command reads, each with a comment" {
+  known=$(sed -n 's/^readonly SETTINGS=(\(.*\))$/\1/p' "$ndce_bin")
+  [ -n "$known" ]
+  in_file=$(defaults_toml | sed -n 's/^\([a-z-]*\) = .*/\1/p')
+  [ "$(tr ' ' '\n' <<<"$known" | sort)" = "$(sort <<<"$in_file")" ]
+  # Each setting's line follows a comment.
+  run awk '/^[a-z-]+ = / && prev !~ /^#/ { print; bad = 1 } { prev = $0 } END { exit bad }' \
+    "$repo/share/nix-devshell-cached-exports/defaults.toml"
+  [ "$status" -eq 0 ]
+  run ndce --print-defaults
+  [ "$status" -eq 0 ]
+  [ "$output" = "$(defaults_toml)" ]
+}
+
+@test "config: no user config, or an empty one, gives exactly the defaults" {
+  unset NDCE_PASSTHROUGH
+  run --separate-stderr ndce --print-config
+  [ "$status" -eq 0 ]
+  [ -z "$stderr" ]
+  none=$output
+  [ "$(grep -c '  # defaults: ' <<<"$none")" -eq 5 ]
+  [[ $none == *'flake-source = "auto"'* ]]
+  [[ $none == *'secret-vars = []'* ]]
+  [[ $none == *'prepend-vars = ["PATH", "XDG_DATA_DIRS"]'* ]]
+  [[ $none == *'passthrough = ["HOME", "USER", '*'"XDG_*", "TMPDIR"]'* ]]
+
+  write_user_config ''
+  run --separate-stderr ndce --print-config
+  [ "$status" -eq 0 ]
+  [ "$output" = "$none" ]
+}
+
+@test "config: a user file changes only its keys; a list replaces whole; the environment wins" {
+  unset NDCE_PASSTHROUGH
+  write_user_config '# mine' \
+    'secret-vars = [' \
+    "  \"*TOKEN*\", # API tokens" \
+    "  '*KEY*'" \
+    ']' \
+    'prepend-vars = []' \
+    "flake-source = 'tree'"
+  run --separate-stderr ndce --print-config
+  [ "$status" -eq 0 ]
+  [[ $output == *"secret-vars = [\"*TOKEN*\", \"*KEY*\"]  # user: $user_config"* ]]
+  [[ $output == *"prepend-vars = []  # user: $user_config"* ]]
+  [[ $output == *"flake-source = \"tree\"  # user: $user_config"* ]]
+  [[ $output == *'exclude = ["TMPDIR", '*'  # defaults: '* ]]
+
+  NDCE_FLAKE_SOURCE=minimal NDCE_SECRET_VARS='A  B' run ndce --print-config
+  [[ $output == *'flake-source = "minimal"  # environment: NDCE_FLAKE_SOURCE'* ]]
+  [[ $output == *'secret-vars = ["A", "B"]  # environment: NDCE_SECRET_VARS'* ]]
+}
+
+@test "config: an unknown key, a wrong kind or value, or a key set twice is refused" {
+  write_user_config 'flake_sourc = "tree"'
+  run --separate-stderr ndce --print-config
+  [ "$status" -eq 1 ]
+  [ "$stderr" = "nix-devshell-cached-exports: $user_config:1: unknown setting: flake_sourc (did you mean flake-source?)" ]
+
+  write_user_config '' 'colour = "red"'
+  run --separate-stderr ndce --print-config
+  [ "$status" -eq 1 ]
+  [[ $stderr == *"$user_config:2: unknown setting: colour" ]]
+
+  write_user_config 'exclude = "SHELL"'
+  run --separate-stderr ndce --print-config
+  [ "$status" -eq 1 ]
+  [[ $stderr == *"exclude takes a list"* ]]
+
+  write_user_config 'flake-source = "nope"'
+  run --separate-stderr ndce --print-config
+  [ "$status" -eq 1 ]
+  [[ $stderr == *"flake-source must be auto, minimal or tree: nope" ]]
+
+  write_user_config 'exclude = ["A" "B"]'
+  run --separate-stderr ndce --print-config
+  [ "$status" -eq 1 ]
+  [[ $stderr == *"expected , or ] in exclude" ]]
+
+  write_user_config 'exclude = ["A",' '"B"'
+  run --separate-stderr ndce --print-config
+  [ "$status" -eq 1 ]
+  [[ $stderr == *"the list has no closing ]" ]]
+
+  write_user_config 'exclude = []' 'exclude = ["A"]'
+  run --separate-stderr ndce --print-config
+  [ "$status" -eq 1 ]
+  [[ $stderr == *"$user_config:2: exclude is set twice" ]]
+
+  # A broken user file stops a load too, rather than being ignored.
+  load_fixture flake-minimal
+  cd "$proj"
+  write_user_config 'colour = "red"'
+  run ndce
+  [ "$status" -eq 1 ]
+  [ "$(nix_log_lines)" -eq 0 ]
+}
+
+@test "config: the user file's settings reach the capture" {
+  load_fixture flake-minimal
+  cd "$proj"
+  set_stub_env 'export HF_TOKEN=tok-value KEEP_ME=1'
+  write_user_config 'secret-vars = ["*token*"]'
+  run --separate-stderr ndce
+  [ "$status" -eq 0 ]
+  [[ $output == *KEEP_ME* && $output != *tok-value* ]]
+  [[ $stderr == *"HF_TOKEN"* ]]
+}
+
+@test "config: --print-config and --print-defaults take no project options" {
+  run ndce --print-config --dir .
+  [ "$status" -eq 2 ]
+  run ndce --print-defaults --refresh
+  [ "$status" -eq 2 ]
+  run ndce --print-config --print-key
+  [ "$status" -eq 2 ]
 }

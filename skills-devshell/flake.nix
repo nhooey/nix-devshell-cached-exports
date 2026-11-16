@@ -1,36 +1,34 @@
 {
-  description = "nix-devshell-cached-exports dev-shell skill set — an isolated sub-flake invoked at RUNTIME by the root devShell, never a root input. The skill sources (all skills-git skills plus nix-flakes from skills-nix) live only in THIS flake's lock, so the root flake stays a leaf with zero skill inputs and transitive consumers never drag the skill mesh in.";
+  description = "nix-devshell-cached-exports dev-shell skill set — an isolated sub-flake invoked at RUNTIME by the root devShell, never a root input, so the skill sources live only in THIS flake's lock and the root flake stays a leaf with zero skill inputs.";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     systems.url = "github:nix-systems/default";
 
-    # `agent-skill-flake` is the builder library, not a skill — it provides
-    # `mkDevshellSkillsFlake`. Followed by every skill source below so the
-    # whole tree shares one evaluation.
+    # The builder lib; it carries no skill inputs.
     agent-skill-flake = {
       url = "github:nhooey/agent-skill-flake";
       inputs.nixpkgs.follows = "nixpkgs";
     };
 
-    # Every input below this divider is a skill source.
-
-    # All of skills-git's skills (git hygiene, GitHub policy, PR lifecycle).
-    skills-git = {
-      url = "github:nhooey/skills-git";
-      inputs = {
-        nixpkgs.follows = "nixpkgs";
-        agent-skill-flake.follows = "agent-skill-flake";
-      };
+    # Skill sources, the same repos `github:nhooey/skillspkgs` aggregates.
+    # They follow `nixpkgs` but not `agent-skill-flake`, so each keeps its own
+    # compatible builder.
+    coding-agent-skills = {
+      url = "github:nhooey/coding-agent-skills";
+      inputs.nixpkgs.follows = "nixpkgs";
     };
-
-    # skills-nix: only nix-flakes is cherry-picked below.
-    skills-nix = {
-      url = "github:nhooey/skills-nix";
-      inputs = {
-        nixpkgs.follows = "nixpkgs";
-        agent-skill-flake.follows = "agent-skill-flake";
-      };
+    git-skills = {
+      url = "github:nhooey/git-skills";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
+    nix-skills = {
+      url = "github:nhooey/nix-skills";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
+    shell-skills = {
+      url = "github:nhooey/shell-skills";
+      inputs.nixpkgs.follows = "nixpkgs";
     };
   };
 
@@ -38,8 +36,6 @@
     {
       nixpkgs,
       agent-skill-flake,
-      skills-git,
-      skills-nix,
       ...
     }@inputs:
     agent-skill-flake.lib.mkDevshellSkillsFlake {
@@ -47,11 +43,25 @@
       systems = import inputs.systems;
       name = "nix-devshell-cached-exports-skills";
       sources = [
-        { source = skills-git; }
+        # Commits, branches and pull requests, and the GitHub policies.
+        { source = inputs.git-skills; }
+        # Writing this flake, the package and the skills sub-flake.
         {
-          source = skills-nix;
+          source = inputs.nix-skills;
           skills = [
             "nix-flakes"
+          ];
+        }
+        # Safe shell commands: named deletes, PIDs, no machine-wide changes.
+        { source = inputs.shell-skills; }
+        # Running as a headless session in a checkout, keeping the
+        # scratchpad tidy, and the plans graph.
+        {
+          source = inputs.coding-agent-skills;
+          skills = [
+            "coding-agent-headless-in-checkout"
+            "coding-agent-plans-as-graph"
+            "coding-agent-scratchpad-scripts"
           ];
         }
       ];

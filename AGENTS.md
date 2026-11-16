@@ -9,26 +9,33 @@ It has two parts, installed separately:
 
 `README.md` describes how both behave.
 
+## Commands
+
+The devshell's `ndce-dev` (`scripts/ndce-dev`) runs the commands for
+working on this repository: `lint`, `fmt`, `test`, `e2e`, `check` and
+`bump-plugin-version`. `ndce-dev --help` describes each, and `--dry-run`
+prints what a command would run. With the plugin loaded, it and the
+devshell's tools (`bats`, `shellcheck`, `shfmt`) are already on `PATH`.
+
 ## Checks
 
 There is no CI. Before committing, run:
 
-- `nix flake check`: shellcheck, formatting, the package build, and the
-  unit and hook suites (`nix` is stubbed). Stage new files first, since
-  Nix only sees tracked ones.
-- `nix develop -c bats tests/e2e.bats`: the same scenarios against real
-  Nix. Each capture takes seconds, so this isn't part of the flake check.
+- `ndce-dev check`: `nix flake check`, which runs shellcheck, formatting,
+  the package build, and the unit and hook suites (`nix` is stubbed). Stage
+  new files first, since Nix only sees tracked ones; `ndce-dev check` lists
+  any you haven't.
+- `ndce-dev e2e`: the same scenarios against real Nix. Each capture takes
+  seconds, so this isn't part of the flake check.
 
-With the plugin loaded, the devshell's tools (`bats`, `shellcheck`,
-`shfmt`) are already on `PATH`. Run `bats tests/unit.bats tests/hooks.bats`
-directly. Inside `bash -c`, `test` is the shell builtin, not the devshell's
-`test` command.
+`ndce-dev test` runs the stubbed suites alone, faster than the flake check.
 
 ## Changing the plugin
 
 After any change under `hooks/` or `agents/`, run
-`scripts/bump-plugin-version` (`minor` by default; also `patch`, `major` or
-`X.Y.Z`). Its header explains why, and the hook tests fail until it's done.
+`ndce-dev bump-plugin-version` (`minor` by default; also `patch`, `major`
+or `X.Y.Z`). The header of `scripts/bump-plugin-version` explains why, and
+the hook tests fail until it's done.
 
 To try a change in Claude Code before releasing it, start a session with
 `claude --plugin-dir .`. A headless run such as

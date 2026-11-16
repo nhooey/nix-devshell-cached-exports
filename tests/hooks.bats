@@ -22,7 +22,12 @@ if [ "\${1-}" = --print-key ]; then
   [ -n "\${NDCE_STUB_NO_PROJECT-}" ] || echo 0123456789abcdef
   exit 0
 fi
-sleep "\${NDCE_STUB_SLEEP:-0}"
+if [ -n "\${NDCE_STUB_RELEASE-}" ]; then
+  for _ in \$(seq 100); do
+    [ -e "\$NDCE_STUB_RELEASE" ] && break
+    sleep 0.1
+  done
+fi
 echo called >>"$STUB_LOG"
 echo 'export NDCE_STUB_OK=1'
 EOF
@@ -69,12 +74,17 @@ EXPECTED_CD_LINE='cd() { builtin cd "$@" || return; command -v nix-devshell-cach
   wait_for_calls $((first_count + 1))
 }
 
+# The stub's warm-up blocks until the release file exists (or 10 s pass),
+# so a hook that waited for it would return with the stub already logged.
 @test "warm-up runs in the background: the hook does not wait for it" {
-  start=$(date +%s)
-  NDCE_STUB_SLEEP=3 PATH="$STUB_DIR:$BARE_PATH" CLAUDE_ENV_FILE="$ENV_FILE" run "$HOOK"
+  release="$BATS_TEST_TMPDIR/release"
+  NDCE_STUB_RELEASE="$release" PATH="$STUB_DIR:$BARE_PATH" CLAUDE_ENV_FILE="$ENV_FILE" run "$HOOK"
   [ "$status" -eq 0 ]
-  [ $(($(date +%s) - start)) -lt 3 ]
   [ "$(grep -cxF -- "$EXPECTED_LINE" "$ENV_FILE")" -eq 1 ]
+  [ ! -s "$STUB_LOG" ]
+
+  touch "$release"
+  wait_for_calls 1
 }
 
 @test "command supports --max-wait: the eval lines pass it" {
@@ -122,7 +132,7 @@ cd() { builtin cd "$@" || return; command -v nix-devshell-cached-exports >/dev/n
 # Claude Code fetches a plugin again only when its version changes, so a
 # hook change without a bump never reaches anyone who already installed it.
 # scripts/bump-plugin-version explains this and sets both versions.
-NEEDS_BUMP="run scripts/bump-plugin-version (see its header for why)"
+NEEDS_BUMP="run ndce-dev bump-plugin-version (see scripts/bump-plugin-version for why)"
 
 @test "plugin.json and marketplace.json give the plugin the same version" {
   v=$(grep -oE '"version": *"[^"]*"' "$REPO_ROOT/.claude-plugin/plugin.json")

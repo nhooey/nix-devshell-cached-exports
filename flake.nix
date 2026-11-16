@@ -74,16 +74,20 @@
           checks = {
             shellcheck =
               pkgs.runCommand "nix-devshell-cached-exports-shellcheck"
-                { nativeBuildInputs = [ pkgs.shellcheck ]; }
+                {
+                  nativeBuildInputs = [
+                    pkgs.bash
+                    pkgs.shellcheck
+                  ];
+                }
                 ''
-                  cd ${./.}
-                  shellcheck --shell=bash bin/nix-devshell-cached-exports hooks/*.sh scripts/* tests/stubs/*
+                  bash ${./.}/scripts/ndce-dev lint
                   touch $out
                 '';
 
             # Sandbox-safe suite: `nix` and `nix-shell` are stubs, since nix
             # cannot enter a devshell inside a build. `tests/e2e.bats` covers
-            # the same scenarios with real nix, run locally via `test-e2e`.
+            # the same scenarios with real nix, run locally via `ndce-dev e2e`.
             unit = pkgs.runCommand "nix-devshell-cached-exports-unit" { nativeBuildInputs = testInputs; } ''
               cp -r ${./.} src
               chmod -R u+w src
@@ -92,7 +96,7 @@
               export HOME=$TMPDIR/home
               mkdir -p "$HOME"
               export NDCE_TEST_PLUGIN_SOURCE=${./.}
-              bats tests/unit.bats tests/hooks.bats
+              scripts/ndce-dev test
               touch $out
             '';
 
@@ -129,33 +133,13 @@
               pkgs.shfmt
             ];
 
+            # One tool with subcommands, kept in scripts/ndce-dev.
             commands = [
               {
                 category = "dev";
-                name = "lint";
-                help = "Run shellcheck on the command, hooks and test stubs";
-                command = ''
-                  cd "$PRJ_ROOT" &&
-                    shellcheck --shell=bash bin/nix-devshell-cached-exports hooks/*.sh scripts/* tests/stubs/*
-                '';
-              }
-              {
-                category = "dev";
-                name = "bump-plugin-version";
-                help = "Set the plugin version, needed for any change to hooks/";
-                command = ''"$PRJ_ROOT/scripts/bump-plugin-version" "$@"'';
-              }
-              {
-                category = "dev";
-                name = "test";
-                help = "Run the sandbox-safe unit suite (stubbed nix)";
-                command = ''cd "$PRJ_ROOT" && bats tests/unit.bats tests/hooks.bats "$@"'';
-              }
-              {
-                category = "dev";
-                name = "test-e2e";
-                help = "Run the end-to-end suite against real nix";
-                command = ''cd "$PRJ_ROOT" && bats tests/e2e.bats "$@"'';
+                name = "ndce-dev";
+                help = "lint, fmt, test, e2e, check, bump-plugin-version (ndce-dev --help)";
+                command = ''exec "$PRJ_ROOT/scripts/ndce-dev" "$@"'';
               }
             ];
           };

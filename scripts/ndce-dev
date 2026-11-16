@@ -1,0 +1,133 @@
+#!/usr/bin/env bash
+# The commands for working on this repository, as one tool with
+# subcommands. The dev shell puts it on PATH as `ndce-dev`; `nix flake check`
+# runs `ndce-dev test` in its sandbox.
+#
+# It is not called `test`, `lint` and so on directly: a dev shell command
+# named `test` shadows test(1) for anything that runs it by name.
+set -euo pipefail
+
+# Every command runs from the repository root, and the paths below are
+# relative to it.
+cd "$(dirname "${BASH_SOURCE[0]}")/.."
+
+# The files shellcheck checks.
+readonly LINT_FILES=(bin/nix-devshell-cached-exports hooks/*.sh scripts/* tests/stubs/*)
+# The sandbox-safe suites (`nix` is stubbed) and the one against real nix.
+readonly UNIT_SUITES=(tests/unit.bats tests/hooks.bats tests/ndce-dev.bats)
+readonly E2E_SUITES=(tests/e2e.bats)
+
+usage() {
+  cat <<'EOF'
+usage: ndce-dev [-n | --dry-run] COMMAND [ARGS...]
+
+Commands:
+  lint                  shellcheck the command, hooks, scripts and test stubs
+  fmt [ARGS...]         format every file with treefmt (`nix fmt`)
+  test [BATS_ARGS...]   run the sandbox-safe suites, with nix stubbed
+  e2e [BATS_ARGS...]    run the end-to-end suite against real nix
+  check [ARGS...]       run `nix flake check`, warning first about files
+                        Nix can't see because git doesn't track them
+  bump-plugin-version [major | minor | patch | X.Y.Z]
+                        set the plugin's version (default: minor); needed
+                        after any change under hooks/ or agents/
+  help [COMMAND]        show this help, or a command's
+
+Options:
+  -n, --dry-run         print the command that would run, and exit
+  -h, --help            show this help
+
+Each command also takes -h or --help. Exit status: the command's own, or 2
+for a usage error.
+EOF
+}
+
+command_help() {
+  case $1 in
+  lint) echo "usage: ndce-dev lint" ;;
+  fmt) echo "usage: ndce-dev fmt [ARGS...]   (ARGS go to treefmt, through nix fmt)" ;;
+  test) echo "usage: ndce-dev test [BATS_ARGS...]   (${UNIT_SUITES[*]})" ;;
+  e2e) echo "usage: ndce-dev e2e [BATS_ARGS...]   (${E2E_SUITES[*]}; each capture takes seconds)" ;;
+  check) echo "usage: ndce-dev check [ARGS...]   (ARGS go to nix flake check)" ;;
+  bump-plugin-version) echo "usage: ndce-dev bump-plugin-version [major | minor | patch | X.Y.Z]   (see scripts/bump-plugin-version)" ;;
+  help) echo "usage: ndce-dev help [COMMAND]" ;;
+  *) return 1 ;;
+  esac
+}
+
+die_usage() {
+  echo "ndce-dev: $*" >&2
+  echo "Run 'ndce-dev --help' for the commands." >&2
+  exit 2
+}
+
+dry_run=
+# Runs its arguments, or prints them under --dry-run.
+run() {
+  if [[ -n $dry_run ]]; then
+    local line
+    line=$(printf '%q ' "$@")
+    echo "${line% }"
+    return
+  fi
+  "$@"
+}
+
+# Warns about untracked files that aren't ignored: a flake sees only what
+# git tracks, so `nix flake check` would test the tree without them.
+warn_untracked() {
+  local untracked=()
+  mapfile -t untracked < <(git ls-files --others --exclude-standard)
+  [[ ${#untracked[@]} -eq 0 ]] && return
+  {
+    echo "ndce-dev: Nix won't see these untracked files; \`git add\` them to check them:"
+    printf '  %s\n' "${untracked[@]}"
+  } >&2
+}
+
+while [[ $# -gt 0 ]]; do
+  case $1 in
+  -n | --dry-run) dry_run=1 ;;
+  -h | --help)
+    usage
+    exit 0
+    ;;
+  -*) die_usage "unknown option: $1" ;;
+  *) break ;;
+  esac
+  shift
+done
+[[ $# -gt 0 ]] || die_usage "no command given"
+
+cmd=$1
+shift
+command_help "$cmd" >/dev/null || die_usage "unknown command: $cmd"
+if [[ ${1-} == -h || ${1-} == --help ]]; then
+  command_help "$cmd"
+  exit 0
+fi
+
+case $cmd in
+lint)
+  [[ $# -eq 0 ]] || die_usage "lint takes no arguments"
+  run shellcheck --shell=bash "${LINT_FILES[@]}"
+  ;;
+fmt) run nix fmt -- "$@" ;;
+test) run bats "${UNIT_SUITES[@]}" "$@" ;;
+e2e) run bats "${E2E_SUITES[@]}" "$@" ;;
+check)
+  [[ -n $dry_run ]] || warn_untracked
+  run nix flake check "$@"
+  ;;
+bump-plugin-version)
+  [[ $# -le 1 ]] || die_usage "bump-plugin-version takes at most one argument"
+  run scripts/bump-plugin-version "$@"
+  ;;
+help)
+  if [[ $# -eq 0 ]]; then
+    usage
+  else
+    command_help "$1" || die_usage "unknown command: $1"
+  fi
+  ;;
+esac
