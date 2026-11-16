@@ -240,6 +240,7 @@ nix-devshell-cached-exports [export] [--dir PATH] [--refresh | --max-wait SECOND
 nix-devshell-cached-exports --print-key [--dir PATH]
 nix-devshell-cached-exports --print-cache-path [--dir PATH]
 nix-devshell-cached-exports --prune [--keep-days N] [--dry-run]
+nix-devshell-cached-exports --print-config | --print-defaults
 nix-devshell-cached-exports -h | --help
 ```
 
@@ -260,6 +261,9 @@ nix-devshell-cached-exports -h | --help
   one's (see [Pruning](#pruning)). `--keep-days N` (default 7) sets how
   recent an entry must be to stay; `--dry-run` prints the paths it would
   delete and deletes nothing. It ends with a one-line summary.
+- `--print-config` prints the settings in effect, each with where it came
+  from; `--print-defaults` prints the shipped defaults file (see
+  [Settings](#settings)).
 - Outside a Nix project (no `flake.nix`, `shell.nix` or `default.nix` in the
   directory or above it), it prints nothing and exits 0, so it's safe to
   call anywhere.
@@ -321,7 +325,7 @@ depends on other files.
   - every tracked `*.nix` file, plus untracked ones for `shell.nix` /
     `default.nix` projects, since `nix-shell` reads those and a flake
     can't;
-  - the project kind and `NDCE_FLAKE_SOURCE`.
+  - the project kind and the `flake-source` setting.
 
   Changing any of them gives a new key and a new capture on the next call.
 
@@ -421,9 +425,10 @@ A capture never writes `flake.lock`, from the copy or the project: it runs
 resolved in memory for that capture only, and a `nix flake update` run
 while a capture is going is kept (the next load captures again under the
 new lock). Lock the flake yourself (`nix flake lock`) to pin its inputs.
-`NDCE_FLAKE_SOURCE=minimal` always uses the
-copy, without checking; `tree` always uses the project. Set it per project
-in `.claude/settings.json` (`"env": {"NDCE_FLAKE_SOURCE": "tree"}`) or in
+The `flake-source` setting (see [Settings](#settings)) picks this: `auto`,
+the default, as above; `minimal` always uses the copy, without checking;
+`tree` always uses the project. Set it per project in
+`.claude/settings.json` (`"env": {"NDCE_FLAKE_SOURCE": "tree"}`) or in
 `.envrc`.
 
 **GC roots.** A flake's capture registers its devshell as a GC root
@@ -441,8 +446,8 @@ on disk, in backups, and readable by anything running as that user. A
 devshell that reads a secret from a file in the project already has it on
 disk, so every variable is cached by default. For a devshell that fetches a
 secret when entered, from a keychain or password manager, set
-`NDCE_SECRET_VARS` to space-separated patterns, matched in any case (such as
-`*TOKEN* *SECRET* *PASSWORD*`). Matching variables are left out of the
+`secret-vars` (see [Settings](#settings)) to patterns, matched in any case
+(such as `*TOKEN* *SECRET* *PASSWORD*`). Matching variables are left out of the
 cache, with a warning naming them, so load those another way.
 
 ### When a capture fails
@@ -470,24 +475,51 @@ caller's `PATH`, the launcher hides it, so running the command starts an
 interactive devshell instead. The capture warns about this; the fix is to
 give the devshell a name of its own (`devshell.name`).
 
-### Overrides
+### Settings
 
-These take space-separated names, with `*` as a wildcard:
+Every setting and its default is in
+[`share/nix-devshell-cached-exports/defaults.toml`](share/nix-devshell-cached-exports/defaults.toml),
+which ships with the command and documents each one;
+`nix-devshell-cached-exports --print-defaults` prints it. Three layers
+apply, each over the one before:
 
-- `NDCE_PASSTHROUGH`: variables passed into the capture (default: `HOME
-  USER LOGNAME PATH TERM LANG LC_* TZ NIX_PATH NIX_CONFIG
-  NIX_USER_CONF_FILES NIX_SSL_CERT_FILE SSL_CERT_FILE NIX_REMOTE
-  SSH_AUTH_SOCK GIT_SSH GIT_SSH_COMMAND XDG_* TMPDIR`).
-- `NDCE_EXCLUDE`: variables never exported, whatever the devshell does
-  (default: `TMPDIR TMP TEMP TEMPDIR NIX_BUILD_TOP SHLVL PWD OLDPWD _
-  __CF_USER_TEXT_ENCODING BASH_* BASHOPTS SHELLOPTS SHELL`). `SHELL` is
-  excluded so a devshell's doesn't replace the caller's, and is always
-  excluded when it is `/sbin/nologin` or `/usr/bin/false`.
-- `NDCE_PREPEND_VARS`: colon-separated lists put in front of the caller's
-  value instead of replacing it (default: `PATH XDG_DATA_DIRS`). An entry
-  the caller already has doesn't count as added unless it is in the Nix
-  store, since a caller started inside the devshell already has those.
-- `NDCE_SECRET_VARS` and `NDCE_FLAKE_SOURCE`, described above.
+1. the shipped defaults;
+2. your config file,
+   `~/.config/nix-devshell-cached-exports/config.toml` (under
+   `$XDG_CONFIG_HOME` when that is set), holding only the settings you
+   change;
+3. an `NDCE_*` variable per setting, as space-separated words, for one
+   project (`.claude/settings.json` or `.envrc`) or one call.
+
+For example:
+
+```toml
+secret-vars = ["*TOKEN*", "*SECRET*", "*PASSWORD*"]
+flake-source = "tree"
+```
+
+A list replaces the default list whole, and `[]` empties it. A key the
+defaults file doesn't have, a value of the wrong kind or a key set twice is
+an error naming the file and line, and stops every call until it's fixed.
+The files take a subset of TOML: quoted strings without escapes, and lists
+of them, which may span lines. `--print-config` prints the settings in
+effect, each with the layer it came from.
+
+The settings, with their variables:
+
+- `passthrough` (`NDCE_PASSTHROUGH`): variables passed into the capture.
+- `exclude` (`NDCE_EXCLUDE`): variables never exported, whatever the
+  devshell does. `SHELL` is in the default list so a devshell's doesn't
+  replace the caller's, and is always excluded when it is `/sbin/nologin`
+  or `/usr/bin/false`.
+- `prepend-vars` (`NDCE_PREPEND_VARS`): colon-separated lists put in front
+  of the caller's value instead of replacing it. An entry the caller
+  already has doesn't count as added unless it is in the Nix store, since a
+  caller started inside the devshell already has those.
+- `secret-vars` (`NDCE_SECRET_VARS`) and `flake-source`
+  (`NDCE_FLAKE_SOURCE`), described above.
+
+The first four take variable names, with `*` as a wildcard.
 
 ## Measured
 

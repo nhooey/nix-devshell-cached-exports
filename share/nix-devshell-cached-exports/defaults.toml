@@ -1,0 +1,51 @@
+# nix-devshell-cached-exports: every setting, at its default.
+#
+# This file ships with the command and is read on every call. Don't copy
+# it: put only the settings you change in
+# ~/.config/nix-devshell-cached-exports/config.toml (under
+# $XDG_CONFIG_HOME when that is set), which is merged over this file key by
+# key. An environment variable, named in each setting's comment, overrides
+# both, as space-separated words. A list replaces the default list whole;
+# `[]` empties it. A key this file doesn't have is an error.
+#
+# `nix-devshell-cached-exports --print-config` shows the settings in effect
+# and where each came from; `--print-defaults` prints this file.
+#
+# The files take a subset of TOML: `key = "string"` (or 'string') and
+# `key = [ "word", ... ]`, which may span lines, with `#` comments. Strings
+# have no escapes.
+
+# Variables passed into the capture, which runs under `env -i`. Shell
+# patterns, `*` matching any run of characters. NDCE_PASSTHROUGH.
+passthrough = [
+  "HOME", "USER", "LOGNAME", "PATH", "TERM", "LANG", "LC_*", "TZ",
+  "NIX_PATH", "NIX_CONFIG", "NIX_USER_CONF_FILES", "NIX_SSL_CERT_FILE",
+  "SSL_CERT_FILE", "NIX_REMOTE", "SSH_AUTH_SOCK", "GIT_SSH",
+  "GIT_SSH_COMMAND", "XDG_*", "TMPDIR",
+]
+
+# Variables never exported, whatever the devshell does. Shell patterns.
+# SHELL is here so a devshell's doesn't replace the caller's. NDCE_EXCLUDE.
+exclude = [
+  "TMPDIR", "TMP", "TEMP", "TEMPDIR", "NIX_BUILD_TOP", "SHLVL", "PWD",
+  "OLDPWD", "_", "__CF_USER_TEXT_ENCODING", "BASH_*", "BASHOPTS",
+  "SHELLOPTS", "SHELL",
+]
+
+# Colon-separated lists put in front of the caller's value instead of
+# replacing it. Shell patterns; only names that are valid variable names
+# take effect. NDCE_PREPEND_VARS.
+prepend-vars = ["PATH", "XDG_DATA_DIRS"]
+
+# Variables left out of the cache, with a warning naming them. Shell
+# patterns matched in any case, such as "*TOKEN*". None by default: a
+# devshell that reads a secret from a file has it on disk already, and
+# leaving it out breaks what needs it. NDCE_SECRET_VARS.
+secret-vars = []
+
+# What a flake's capture evaluates: "auto" a copy of only the files the
+# cache key covers when the .nix files show no sign of reading anything
+# else, "minimal" that copy always, "tree" the project itself (which Nix
+# copies whole into the store for each new state of it). Part of the cache
+# key. NDCE_FLAKE_SOURCE.
+flake-source = "auto"

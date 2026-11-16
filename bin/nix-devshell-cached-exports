@@ -46,6 +46,7 @@ Usage: $PROG [export] [--dir PATH] [--refresh | --max-wait SECONDS] [--format ba
        $PROG --print-key [--dir PATH]
        $PROG --print-cache-path [--dir PATH]
        $PROG --prune [--keep-days N] [--dry-run]
+       $PROG --print-config | --print-defaults
        $PROG -h | --help
 
 Print the environment the project's Nix devshell adds, as export statements,
@@ -66,6 +67,12 @@ from a cache keyed on the files that define the devshell:
                       their GC roots) but the newest and those written within
                       --keep-days N days (default: $PRUNE_KEEP_DAYS)
   --dry-run           with --prune, print what would go and delete nothing
+  --print-config      print the settings in effect, each with where it came
+                      from: the shipped defaults, the user's config file
+                      ($user_config_file)
+                      or an NDCE_* variable
+  --print-defaults    print the shipped defaults file, which documents every
+                      setting
   -h, --help          show this help
 
 Outside a Nix project it prints nothing and exits 0.
@@ -81,6 +88,218 @@ usage_error() {
 die() {
   printf '%s: %s\n' "$PROG" "$1" >&2
   exit 1
+}
+
+# ---------------------------------------------------------------------------
+# Settings
+#
+# Every setting's default is in the shipped defaults file (package.nix sets
+# __NDCE_DEFAULTS_FILE; a checkout reads share/ beside bin/). The user's
+# config file is merged over it key by key, and the NDCE_* variables over
+# that. Code reads the merged values and has no defaults of its own.
+
+# The settings, each a list of words or a string, and the variable that
+# overrides it.
+readonly SETTINGS=(passthrough exclude prepend-vars secret-vars flake-source)
+declare -rA SETTING_KIND=([passthrough]=list [exclude]=list ["prepend-vars"]=list
+  ["secret-vars"]=list ["flake-source"]=string)
+declare -rA SETTING_ENV=([passthrough]=NDCE_PASSTHROUGH [exclude]=NDCE_EXCLUDE
+  ["prepend-vars"]=NDCE_PREPEND_VARS ["secret-vars"]=NDCE_SECRET_VARS
+  ["flake-source"]=NDCE_FLAKE_SOURCE)
+
+defaults_file=${__NDCE_DEFAULTS_FILE:-${self%/*}/../share/$PROG/defaults.toml}
+if [[ ${XDG_CONFIG_HOME-} == /* ]]; then
+  user_config_file=$XDG_CONFIG_HOME/$PROG/config.toml
+elif [[ -n ${HOME-} ]]; then
+  user_config_file=$HOME/.config/$PROG/config.toml
+else
+  user_config_file=
+fi
+
+# Each setting's merged value (a list as space-separated words) and the
+# layer it came from.
+declare -A cfg_value=() cfg_source=()
+
+# check_setting KEY VALUE WHERE : dies unless VALUE is allowed for KEY.
+check_setting() {
+  case $1 in
+  flake-source)
+    case $2 in
+    auto | minimal | tree) ;;
+    *) die "$3 must be auto, minimal or tree: $2" ;;
+    esac
+    ;;
+  esac
+}
+
+# closest_setting NAME : sets `closest` to the setting nearest NAME by edit
+# distance, if it is at most 3 edits away, else to nothing.
+closest_setting() {
+  local a=${1//_/-} b k i j cost d best=4
+  local -a row_prev row_cur
+  closest=
+  for k in "${SETTINGS[@]}"; do
+    b=$k
+    row_prev=()
+    for ((j = 0; j <= ${#b}; j++)); do row_prev[j]=$j; done
+    for ((i = 1; i <= ${#a}; i++)); do
+      row_cur=([0]=$i)
+      for ((j = 1; j <= ${#b}; j++)); do
+        cost=1
+        if [[ ${a:i-1:1} == "${b:j-1:1}" ]]; then cost=0; fi
+        d=$((row_prev[j] + 1))
+        if ((row_cur[j - 1] + 1 < d)); then d=$((row_cur[j - 1] + 1)); fi
+        if ((row_prev[j - 1] + cost < d)); then d=$((row_prev[j - 1] + cost)); fi
+        row_cur[j]=$d
+      done
+      row_prev=("${row_cur[@]}")
+    done
+    if ((row_prev[${#b}] < best)); then
+      best=${row_prev[${#b}]}
+      closest=$k
+    fi
+  done
+}
+
+# read_config FILE LABEL : merges the settings in FILE, a subset of TOML
+# (`key = "string"`, `key = [ "word", ... ]` over one or more lines, `#`
+# comments, strings without escapes), over those read so far, recording
+# LABEL as their source. An unknown key, a key set twice or a value of the
+# wrong kind is an error.
+read_config() {
+  local file=$1 label=$2 n=0 line rest key open='' item need_sep=0
+  local -a items=()
+  local -A seen=()
+  local -r re_key='^([A-Za-z0-9_-]+)[[:space:]]*=[[:space:]]*(.*)$'
+  local -r re_dq='^"([^"\]*)"(.*)$' re_sq="^'([^']*)'(.*)\$"
+  bad() { die "$file:$n: $1"; }
+  trim() { rest=${rest#"${rest%%[![:space:]]*}"}; }
+  take_string() {
+    if [[ $rest =~ $re_dq ]] || [[ $rest =~ $re_sq ]]; then
+      item=${BASH_REMATCH[1]} rest=${BASH_REMATCH[2]}
+    else
+      return 1
+    fi
+  }
+  at_end() {
+    trim
+    [[ -z $rest || $rest == '#'* ]]
+  }
+  while IFS= read -r line || [[ -n $line ]]; do
+    ((++n))
+    rest=$line
+    if [[ -z $open ]]; then
+      if at_end; then continue; fi
+      [[ $rest =~ $re_key ]] || bad "expected key = value"
+      key=${BASH_REMATCH[1]} rest=${BASH_REMATCH[2]}
+      if [[ -z ${SETTING_KIND[$key]-} ]]; then
+        closest_setting "$key"
+        bad "unknown setting: $key${closest:+ (did you mean $closest?)}"
+      fi
+      [[ -z ${seen[$key]-} ]] || bad "$key is set twice"
+      seen[$key]=1
+      if [[ $rest == '['* ]]; then
+        [[ ${SETTING_KIND[$key]} == list ]] || bad "$key takes a string, not a list"
+        open=$key items=() need_sep=0 rest=${rest:1}
+      else
+        [[ ${SETTING_KIND[$key]} == string ]] || bad "$key takes a list: [\"word\", ...]"
+        take_string || bad "$key: expected a quoted string without backslashes"
+        at_end || bad "unexpected text after the value of $key"
+        check_setting "$key" "$item" "$file:$n: $key"
+        cfg_value[$key]=$item cfg_source[$key]=$label
+        continue
+      fi
+    fi
+    while ! at_end; do
+      if [[ $rest == ']'* ]]; then
+        rest=${rest:1}
+        at_end || bad "unexpected text after the value of $open"
+        cfg_value[$open]=${items[*]-} cfg_source[$open]=$label
+        open=
+        break
+      fi
+      ((! need_sep)) || bad "expected , or ] in $open"
+      take_string || bad "$open: expected a quoted string without backslashes"
+      [[ -n $item && $item != *[[:space:]]* ]] || bad "$open: an entry can't be empty or hold spaces"
+      items+=("$item")
+      trim
+      if [[ $rest == ,* ]]; then
+        rest=${rest:1}
+      else
+        need_sep=1
+      fi
+    done
+  done <"$file"
+  [[ -z $open ]] || bad "$open: the list has no closing ]"
+}
+
+# load_config : merges the defaults file, the user's config file and the
+# NDCE_* variables into cfg_value.
+load_config() {
+  local key var value
+  local -a list
+  [[ -r $defaults_file ]] || die "cannot read the shipped defaults: $defaults_file"
+  read_config "$defaults_file" "defaults: $defaults_file"
+  for key in "${SETTINGS[@]}"; do
+    [[ -n ${cfg_source[$key]-} ]] || die "$defaults_file: $key has no default"
+  done
+  if [[ -n $user_config_file && -f $user_config_file ]]; then
+    read_config "$user_config_file" "user: $user_config_file"
+  fi
+  for key in "${SETTINGS[@]}"; do
+    var=${SETTING_ENV[$key]}
+    [[ -n ${!var+set} ]] || continue
+    if [[ ${SETTING_KIND[$key]} == list ]]; then
+      list=()
+      read -r -d '' -a list <<<"${!var}" || true
+      value=${list[*]-}
+    else
+      # An empty string variable counts as unset.
+      value=${!var}
+      [[ -n $value ]] || continue
+      check_setting "$key" "$value" "$var"
+    fi
+    cfg_value[$key]=$value cfg_source[$key]="environment: $var"
+  done
+}
+
+# setting_words KEY : sets `list` to the words of list setting KEY.
+setting_words() {
+  list=()
+  read -r -a list <<<"${cfg_value[$1]}" || true
+}
+
+# toml_string STRING : prints STRING as a TOML string.
+toml_string() {
+  if [[ $1 == *[\"\\]* ]]; then
+    printf "'%s'" "$1"
+  else
+    printf '"%s"' "$1"
+  fi
+}
+
+# print_config : prints the merged settings, each with the layer it came
+# from.
+print_config() {
+  local key sep w
+  local -a list
+  for key in "${SETTINGS[@]}"; do
+    if [[ ${SETTING_KIND[$key]} == list ]]; then
+      setting_words "$key"
+      printf '%s = [' "$key"
+      sep=
+      for w in ${list[@]+"${list[@]}"}; do
+        printf '%s' "$sep"
+        toml_string "$w"
+        sep=', '
+      done
+      printf ']'
+    else
+      printf '%s = ' "$key"
+      toml_string "${cfg_value[$key]}"
+    fi
+    printf '  # %s\n' "${cfg_source[$key]}"
+  done
 }
 
 # ---------------------------------------------------------------------------
@@ -215,6 +434,8 @@ while (($#)); do
   --format=*) set_format "${1#--format=}" ;;
   --print-key) set_mode print-key ;;
   --print-cache-path) set_mode print-cache-path ;;
+  --print-config) set_mode print-config ;;
+  --print-defaults) set_mode print-defaults ;;
   --prune) set_mode prune ;;
   --keep-days)
     (($# >= 2)) || usage_error "--keep-days needs a number of days"
@@ -249,6 +470,11 @@ if [[ $mode == prune ]]; then
     usage_error "--keep-days needs a number of days: $keep_days"
 elif [[ -n $keep_days ]] || ((dry_run)); then
   usage_error "--keep-days and --dry-run need --prune"
+fi
+
+if [[ $mode == print-config || $mode == print-defaults ]]; then
+  ((! dir_given && ! refresh)) && [[ -z $max_wait ]] ||
+    usage_error "--$mode cannot be combined with --dir, --refresh or --max-wait"
 fi
 
 if [[ ${XDG_CACHE_HOME-} == /* ]]; then
@@ -375,15 +601,23 @@ if [[ $mode == prune ]]; then
   exit 0
 fi
 
+if [[ $mode == print-defaults ]]; then
+  cat -- "$defaults_file"
+  exit 0
+fi
+
+load_config
+
+if [[ $mode == print-config ]]; then
+  print_config
+  exit 0
+fi
+
 # What a flake's capture evaluates: `auto` a copy of only the files the key
 # covers when the .nix files show no sign of reading anything else, `minimal`
 # that copy always, `tree` the project itself (which Nix copies whole into the
 # store for each new state of it).
-flake_source=${NDCE_FLAKE_SOURCE:-auto}
-case $flake_source in
-auto | minimal | tree) ;;
-*) die "NDCE_FLAKE_SOURCE must be auto, minimal or tree: $flake_source" ;;
-esac
+flake_source=${cfg_value["flake-source"]}
 
 if [[ -z $dir ]]; then
   usage_error "--dir needs a path"
@@ -892,34 +1126,16 @@ is_ident() {
   [[ -n $1 && $1 != [0123456789]* && $1 != *[!$IDENT_CHARS]* ]]
 }
 
-# words VAR DEFAULT... : sets `list` to the words of $VAR if VAR is set,
-# else to DEFAULT.
-words() {
-  local var=$1
-  shift
-  if [[ -n ${!var+set} ]]; then
-    list=()
-    read -r -d '' -a list <<<"${!var}" || true
-  else
-    list=("$@")
-  fi
-}
-
-words NDCE_PASSTHROUGH HOME USER LOGNAME PATH TERM LANG 'LC_*' TZ NIX_PATH \
-  NIX_CONFIG NIX_USER_CONF_FILES NIX_SSL_CERT_FILE SSL_CERT_FILE NIX_REMOTE \
-  SSH_AUTH_SOCK GIT_SSH GIT_SSH_COMMAND 'XDG_*' TMPDIR
-passthrough=("${list[@]}")
-words NDCE_EXCLUDE TMPDIR TMP TEMP TEMPDIR NIX_BUILD_TOP SHLVL PWD OLDPWD _ \
-  __CF_USER_TEXT_ENCODING 'BASH_*' BASHOPTS SHELLOPTS SHELL
-exclude=("${list[@]}")
-# Variables left out of the cache, as shell patterns matched without regard
-# to case. None by default: a devshell that reads a secret from a file has
-# it on disk already, and leaving it out breaks what needs it.
-words NDCE_SECRET_VARS
+setting_words passthrough
+passthrough=(${list[@]+"${list[@]}"})
+setting_words exclude
+exclude=(${list[@]+"${list[@]}"})
+# Matched without regard to case.
+setting_words secret-vars
 secret_vars=(${list[@]+"${list[@]}"})
-words NDCE_PREPEND_VARS PATH XDG_DATA_DIRS
+setting_words prepend-vars
 prepend_vars=()
-for v in "${list[@]}"; do
+for v in ${list[@]+"${list[@]}"}; do
   is_ident "$v" && prepend_vars+=("$v")
 done
 
@@ -1284,7 +1500,7 @@ tail="export __NDCE_ROOT=$quoted_root
 export __NDCE_VARS=$quoted
 "
 if [[ -n $secrets ]]; then
-  warning+="$PROG: in $root, left out of the cache by NDCE_SECRET_VARS, so not set:$secrets."$'\n'
+  warning+="$PROG: in $root, left out of the cache by secret-vars (${cfg_source["secret-vars"]}), so not set:$secrets."$'\n'
 fi
 
 # The store path a cache hit checks is still there: the first one the PATH

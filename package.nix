@@ -34,6 +34,7 @@ in
   # line, and writeShellApplication supplies its own.
   text = ''
     __NDCE_TOOLS_PATH=${lib.escapeShellArg (lib.makeBinPath tools)}
+    __NDCE_DEFAULTS_FILE=${./share/nix-devshell-cached-exports/defaults.toml}
   ''
   + lib.removePrefix "#!/usr/bin/env bash\n" (builtins.readFile ./bin/nix-devshell-cached-exports);
 }).overrideAttrs
