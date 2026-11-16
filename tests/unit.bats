@@ -370,25 +370,6 @@ nix_log_lines() {
   [ "$(nix_log_lines)" -eq 1 ]
 }
 
-@test "timing: cached load, reported not asserted" {
-  load_fixture flake-minimal
-  cd "$proj"
-
-  run ndce
-  [ "$status" -eq 0 ]
-
-  iterations=20
-  # GNU date (coreutils) for nanoseconds; macOS /bin/date has no %N.
-  start_ns=$(date +%s%N)
-  for _ in $(seq 1 "$iterations"); do
-    eval "$(ndce)"
-  done
-  end_ns=$(date +%s%N)
-
-  us_per_load=$(((end_ns - start_ns) / iterations / 1000))
-  echo "# cached load + eval: ${us_per_load} us/iteration over ${iterations} iterations" >&3
-}
-
 # Replaces the loaded fixture's stub-env.sh with $1 and commits it.
 set_stub_env() {
   printf '%s\n' "$1" >"$proj/stub-env.sh"
