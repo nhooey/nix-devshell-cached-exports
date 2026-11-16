@@ -222,6 +222,11 @@ read_config() {
         open=
         break
       fi
+      # The comma after an entry may open the next line.
+      if ((need_sep)) && [[ $rest == ,* ]]; then
+        rest=${rest:1} need_sep=0
+        continue
+      fi
       ((! need_sep)) || bad "expected , or ] in $open"
       take_string || bad "$open: expected a quoted string without backslashes"
       [[ -n $item && $item != *[[:space:]]* ]] || bad "$open: an entry can't be empty or hold spaces"
