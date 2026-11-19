@@ -60,7 +60,10 @@ load_fixture() {
   local name=$1 dest=${2:-$BATS_TEST_TMPDIR/proj}
   mkdir -p "$dest"
   cp -R "$fixtures/$name/." "$dest/"
-  (cd "$dest" && git init -q -b main && git add -A && git commit -q -m init)
+  # The files just copied, hidden and nested ones too, to commit by name.
+  local -a copied
+  mapfile -d '' copied < <(cd "$fixtures/$name" && find . \( -type f -o -type l \) -print0)
+  (cd "$dest" && git init -q -b main && git add -- "${copied[@]}" && git commit -q -m init)
   proj=$(cd -P "$dest" && pwd)
 }
 
@@ -109,7 +112,7 @@ nix_log_lines() {
   [ "$(nix_log_lines)" -eq 1 ]
 
   echo "# a no-op comment" >>"$proj/flake.nix"
-  (cd "$proj" && git add -A && git commit -q -m edit)
+  (cd "$proj" && git add -- flake.nix marker && git commit -q -m edit)
 
   run ndce
   [ "$status" -eq 0 ]
@@ -231,7 +234,7 @@ nix_log_lines() {
   load_fixture flake-minimal
   cd "$proj"
   touch BROKEN
-  git add -A && git commit -q -m broken
+  git add -- BROKEN && git commit -q -m broken
 
   run ndce --print-cache-path
   [ "$status" -eq 0 ]
@@ -265,7 +268,7 @@ nix_log_lines() {
   # (and fails) a capture.
   touch BROKEN
   echo "# now broken" >>flake.nix
-  git add -A && git commit -q -m broken
+  git add -- BROKEN flake.nix && git commit -q -m broken
 
   run --separate-stderr ndce
   [ "$status" -eq 0 ]
@@ -331,7 +334,7 @@ nix_log_lines() {
   esac
 
   echo "# a no-op comment" >>"$proj/flake.nix"
-  git add -A && git commit -q -m edit
+  git add -- flake.nix && git commit -q -m edit
 
   run ndce --print-key
   [ "$status" -eq 0 ]
@@ -375,7 +378,7 @@ nix_log_lines() {
 # Replaces the loaded fixture's stub-env.sh with $1 and commits it.
 set_stub_env() {
   printf '%s\n' "$1" >"$proj/stub-env.sh"
-  (cd "$proj" && git add -A && git commit -q -m stub-env)
+  (cd "$proj" && git add -- stub-env.sh && git commit -q -m stub-env)
 }
 
 @test "a process the shell hook leaves running does not hold the capture lock" {
@@ -389,7 +392,7 @@ export FIXTURE_MINIMAL=1'
   [ "$status" -eq 0 ]
 
   echo "# edit" >>flake.nix
-  git add -A && git commit -q -m edit
+  git add -- flake.nix bg.pid && git commit -q -m edit
 
   run timeout 10 bash "$ndce_bin"
   kill "$(cat bg.pid)" 2>/dev/null || true
@@ -440,7 +443,7 @@ printf ready'
   for pair in $'x = 1;\n|y = 2;\n' $'x = 1;|\ny = 2;\n' $'x = 1;\ny| = 2;\n'; do
     printf '%s' "${pair%%|*}" >a.nix
     printf '%s' "${pair#*|}" >b.nix
-    git add -A && git commit -q -m "$pair"
+    git add -- a.nix b.nix && git commit -q -m "$pair"
     run ndce --print-key
     [ "$status" -eq 0 ]
     keys+=("$output")
@@ -454,7 +457,7 @@ printf ready'
   load_fixture flake-minimal
   cd "$proj"
   touch BROKEN
-  git add -A && git commit -q -m broken
+  git add -- BROKEN && git commit -q -m broken
 
   run --separate-stderr ndce
   [ "$status" -ne 0 ]
@@ -517,7 +520,7 @@ wait_for_entry() {
   good_output=$output
 
   echo "# edit" >>flake.nix
-  git add -A && git commit -q -m edit
+  git add -- flake.nix && git commit -q -m edit
   export STUB_NIX_SLEEP=3
 
   run --separate-stderr ndce --max-wait 1
@@ -561,7 +564,7 @@ make_flake() {
   proj=$BATS_TEST_TMPDIR/proj
   mkdir -p "$proj"
   printf '%s\n' "$1" >"$proj/flake.nix"
-  (cd "$proj" && git init -q -b main && git add -A && git commit -q -m init)
+  (cd "$proj" && git init -q -b main && git add -- flake.nix && git commit -q -m init)
   proj=$(cd -P "$proj" && pwd)
   cd "$proj"
 }
@@ -589,7 +592,7 @@ key() {
   # Paths are resolved from the .nix file's own directory.
   mkdir -p nix
   printf '{ a = import ../scripts/setup.sh; }\n' >nix/sub.nix
-  git add -A && git commit -q -m sub
+  git add -- scripts/setup.sh README.md nix/sub.nix && git commit -q -m sub
   k3=$(key)
   echo three >scripts/setup.sh
   [ "$(key)" != "$k3" ]
@@ -601,7 +604,7 @@ key() {
   echo a >Cargo.lock
   echo a >rust/Cargo.lock
   echo a >examples/web/package-lock.json
-  git add -A && git commit -q -m locks
+  git add -- Cargo.lock rust/Cargo.lock examples/web/package-lock.json && git commit -q -m locks
   k1=$(key)
 
   # Not referenced: editing it does not change the key.
@@ -610,7 +613,7 @@ key() {
 
   # Named in a .nix file: the one beside it counts, not a nested one.
   printf '{ outputs = _: { lock = "Cargo.lock"; }; }\n' >flake.nix
-  git add -A && git commit -q -m named
+  git add -- flake.nix Cargo.lock && git commit -q -m named
   k2=$(key)
   echo b >rust/Cargo.lock
   [ "$(key)" = "$k2" ]
@@ -619,14 +622,14 @@ key() {
 
   # In a directory a path literal names.
   printf '{ outputs = _: { lock = "${./rust}/x"; }; }\n' >flake.nix
-  git add -A && git commit -q -m dir
+  git add -- flake.nix Cargo.lock rust/Cargo.lock && git commit -q -m dir
   k3=$(key)
   echo c >rust/Cargo.lock
   [ "$(key)" != "$k3" ]
 
   # `src = ./.` counts the root's lock files, not nested ones.
   printf '{ outputs = _: { src = ./.; }; }\n' >flake.nix
-  git add -A && git commit -q -m src
+  git add -- flake.nix rust/Cargo.lock && git commit -q -m src
   k4=$(key)
   echo b >examples/web/package-lock.json
   [ "$(key)" = "$k4" ]
@@ -660,7 +663,7 @@ key() {
   load_fixture shell-nix
   cd "$proj"
   printf '{ pkgs ? import <nixpkgs> { } }: pkgs.mkShellNoCC { }\n' >shell.nix
-  git add -A && git commit -q -m angle
+  git add -- shell.nix && git commit -q -m angle
   k1=$(NIX_PATH=nixpkgs=/a key)
   [ "$(NIX_PATH=nixpkgs=/a key)" = "$k1" ]
   [ "$(NIX_PATH=nixpkgs=/b key)" != "$k1" ]
@@ -921,7 +924,7 @@ fake_store() {
   rm -rf "$tool"
   touch BROKEN
   echo "# edit" >>flake.nix
-  git add -A && git commit -q -m broken
+  git add -- BROKEN flake.nix && git commit -q -m broken
   run ndce
   [ "$status" -eq 1 ]
   [[ $output != *"export "* ]]
@@ -959,7 +962,7 @@ locked_flake() {
   load_fixture flake-minimal
   cd "$proj"
   echo '{}' >flake.lock
-  git add -A && git commit -q -m lock
+  git add -- flake.lock && git commit -q -m lock
 }
 
 @test "source: a flake that reads nothing else is captured from a copy of its files, with a GC root" {
@@ -978,7 +981,7 @@ locked_flake() {
 @test "source: a reference to the project's own source still tries the copy first" {
   locked_flake
   sed -i 's|FIXTURE_MINIMAL = "1";|FIXTURE_MINIMAL = "1"; src = inputs.self; other = ./.;|' flake.nix
-  git add -A && git commit -q -m self
+  git add -- flake.nix && git commit -q -m self
   run ndce
   [ "$status" -eq 0 ]
   [ "$(nix_log_lines)" -eq 1 ]
@@ -988,7 +991,7 @@ locked_flake() {
 @test "source: a devshell that depends on the copy is captured again from the project" {
   locked_flake
   touch REFS_SOURCE
-  git add -A && git commit -q -m refs
+  git add -- REFS_SOURCE && git commit -q -m refs
   run ndce
   [ "$status" -eq 0 ]
   [ "$(nix_log_lines)" -eq 2 ]
@@ -1000,14 +1003,14 @@ locked_flake() {
   locked_flake
   mkdir -p ../sibling
   sed -i 's|FIXTURE_MINIMAL = "1";|FIXTURE_MINIMAL = "1"; other = ../sibling;|' flake.nix
-  git add -A && git commit -q -m outside
+  git add -- flake.nix && git commit -q -m outside
   run ndce
   [ "$status" -eq 0 ]
   [ "$(nix_log_lines)" -eq 1 ]
   grep -q "^nix develop $proj " "$STUB_NIX_LOG"
 
   sed -i 's|other = ../sibling;||' flake.nix
-  git add -A && git commit -q -m plain
+  git add -- flake.nix && git commit -q -m plain
   : >"$STUB_NIX_LOG"
   NDCE_FLAKE_SOURCE=tree run ndce
   [ "$status" -eq 0 ]
@@ -1020,7 +1023,7 @@ locked_flake() {
 @test "source: NDCE_FLAKE_SOURCE=minimal keeps the copy without checking it" {
   locked_flake
   touch REFS_SOURCE
-  git add -A && git commit -q -m refs
+  git add -- REFS_SOURCE && git commit -q -m refs
   NDCE_FLAKE_SOURCE=minimal run ndce
   [ "$status" -eq 0 ]
   [ "$(nix_log_lines)" -eq 1 ]
@@ -1107,7 +1110,7 @@ two_projects() {
 @test "source: a copy that fails to evaluate is retried on the project" {
   locked_flake
   touch NEEDS_TREE
-  git add -A && git commit -q -m needs-tree
+  git add -- NEEDS_TREE && git commit -q -m needs-tree
   run ndce
   [ "$status" -eq 0 ]
   [ "$(nix_log_lines)" -eq 2 ]
@@ -1118,7 +1121,7 @@ two_projects() {
 @test "lock: a capture from the copy leaves the project's flake.lock alone" {
   locked_flake
   touch LOCK_UPDATE
-  git add -A && git commit -q -m lock-update
+  git add -- LOCK_UPDATE && git commit -q -m lock-update
   run ndce
   [ "$status" -eq 0 ]
   [ "$(cat flake.lock)" = '{}' ]
@@ -1132,7 +1135,7 @@ two_projects() {
   load_fixture flake-minimal
   cd "$proj"
   touch LOCK_UPDATE
-  git add -A && git commit -q -m lock-update
+  git add -- LOCK_UPDATE && git commit -q -m lock-update
   run ndce
   [ "$status" -eq 0 ]
   [ ! -e flake.lock ]

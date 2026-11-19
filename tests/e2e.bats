@@ -72,6 +72,9 @@ load_fixture() {
 
   mkdir -p "$dest"
   cp -R "$fixtures/$name/." "$dest/"
+  # The files just copied, hidden and nested ones too, to commit by name.
+  local -a copied
+  mapfile -d '' copied < <(cd "$fixtures/$name" && find . \( -type f -o -type l \) -print0)
 
   if [ -f "$dest/flake.nix" ]; then
     sed -i.bak "s|@NIXPKGS_URL@|github:NixOS/nixpkgs/$nixpkgs_rev|g" "$dest/flake.nix"
@@ -82,7 +85,7 @@ load_fixture() {
     rm -f "$dest/shell.nix.bak"
   fi
 
-  (cd "$dest" && git init -q -b main && git add -A && git commit -q -m init)
+  (cd "$dest" && git init -q -b main && git add -- "${copied[@]}" && git commit -q -m init)
   proj=$(cd -P "$dest" && pwd)
 }
 
@@ -99,7 +102,7 @@ load_fixture() {
   [ "$(wc -l <"$proj/marker" | tr -d ' ')" -eq 1 ]
 
   echo "# a no-op comment" >>"$proj/flake.nix"
-  git -C "$proj" add -A && git -C "$proj" commit -q -m edit
+  git -C "$proj" add -- flake.nix marker && git -C "$proj" commit -q -m edit
 
   run ndce
   [ "$status" -eq 0 ]
@@ -116,10 +119,10 @@ load_fixture() {
   [ "$status" -eq 0 ]
   [ ! -e flake.lock ]
   nix flake lock
-  git add -A && git commit -q -m lock
+  git add -- flake.lock marker && git commit -q -m lock
 
   echo "# a no-op comment" >>flake.nix
-  git add -A && git commit -q -m edit
+  git add -- flake.nix && git commit -q -m edit
   run ndce
   [ "$status" -eq 0 ]
   eval "$output"
@@ -144,7 +147,7 @@ load_fixture() {
   run ndce
   [ "$status" -eq 0 ]
   sed -i 's|{ nixpkgs, ... }:|{ self, nixpkgs, ... }:|; s|FIXTURE_MINIMAL = "1";|FIXTURE_MINIMAL = "1"; FIXTURE_SRC = "${self}";|' flake.nix
-  git add -A && git commit -q -m self-src
+  git add -- flake.nix && git commit -q -m self-src
 
   run ndce
   [ "$status" -eq 0 ]
@@ -243,7 +246,7 @@ load_fixture() {
   good_output=$output
 
   echo 'this is not valid nix syntax {{{' >>"$proj/flake.nix"
-  git -C "$proj" add -A && git -C "$proj" commit -q -m break
+  git -C "$proj" add -- flake.nix && git -C "$proj" commit -q -m break
 
   run --separate-stderr ndce
   [ "$status" -eq 0 ]
