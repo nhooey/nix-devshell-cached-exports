@@ -44,7 +44,7 @@ setup() {
 @test "--dry-run prints each command's invocation, from the repository root" {
   cd "$BATS_TEST_TMPDIR"
   run "$DEV" --dry-run test --filter foo
-  [ "$output" = "bats tests/unit.bats tests/hooks.bats tests/ndce-dev.bats --filter foo" ]
+  [ "$output" = "bats tests/unit.bats tests/hooks.bats tests/ndce-dev.bats tests/sweeping-git-add.bats --filter foo" ]
   run "$DEV" -n e2e
   [ "$output" = "bats tests/e2e.bats" ]
   run "$DEV" -n fmt
@@ -62,7 +62,7 @@ setup() {
   mkdir -p "$repo/scripts" "$BATS_TEST_TMPDIR/bin"
   cp "$DEV" "$repo/scripts/"
   git -C "$repo" init -q
-  git -C "$repo" add scripts
+  git -C "$repo" add -- scripts/ndce-dev
   echo ignored >"$repo/.gitignore"
   touch "$repo/new file" "$repo/ignored"
   printf '#!/bin/sh\necho "nix $*"\n' >"$BATS_TEST_TMPDIR/bin/nix"
@@ -84,5 +84,5 @@ setup() {
 
 @test "--dry-run quotes arguments so the printed line can be run again" {
   run "$DEV" -n test --filter 'a b'
-  [ "$output" = 'bats tests/unit.bats tests/hooks.bats tests/ndce-dev.bats --filter a\ b' ]
+  [ "$output" = 'bats tests/unit.bats tests/hooks.bats tests/ndce-dev.bats tests/sweeping-git-add.bats --filter a\ b' ]
 }

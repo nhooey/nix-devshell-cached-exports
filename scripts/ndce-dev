@@ -14,7 +14,7 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.."
 # The files shellcheck checks.
 readonly LINT_FILES=(bin/nix-devshell-cached-exports hooks/*.sh scripts/* tests/stubs/*)
 # The sandbox-safe suites (`nix` is stubbed) and the one against real nix.
-readonly UNIT_SUITES=(tests/unit.bats tests/hooks.bats tests/ndce-dev.bats)
+readonly UNIT_SUITES=(tests/unit.bats tests/hooks.bats tests/ndce-dev.bats tests/sweeping-git-add.bats)
 readonly E2E_SUITES=(tests/e2e.bats)
 
 usage() {
