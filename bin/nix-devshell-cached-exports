@@ -46,6 +46,7 @@ Usage: $PROG [export] [--dir PATH] [--refresh | --max-wait SECONDS] [--format ba
        $PROG --print-key [--dir PATH]
        $PROG --print-cache-path [--dir PATH]
        $PROG --prune [--keep-days N] [--dry-run]
+       $PROG --forget ROOT [--dry-run]
        $PROG --print-config | --print-defaults
        $PROG -h | --help
 
@@ -66,7 +67,10 @@ from a cache keyed on the files that define the devshell:
   --prune             in every project's cache folder, delete the entries (and
                       their GC roots) but the newest and those written within
                       --keep-days N days (default: $PRUNE_KEEP_DAYS)
-  --dry-run           with --prune, print what would go and delete nothing
+  --forget ROOT       delete the cache folder of one project root, such as a
+                      worktree being removed, with its entries and GC roots
+  --dry-run           with --prune or --forget, print what would go and
+                      delete nothing
   --print-config      print the settings in effect, each with where it came
                       from: the shipped defaults, the user's config file
                       ($user_config_file)
@@ -217,6 +221,11 @@ read_config() {
         cfg_value[$open]=${items[*]-} cfg_source[$open]=$label
         open=
         break
+      fi
+      # The comma after an entry may open the next line.
+      if ((need_sep)) && [[ $rest == ,* ]]; then
+        rest=${rest:1} need_sep=0
+        continue
       fi
       ((! need_sep)) || bad "expected , or ] in $open"
       take_string || bad "$open: expected a quoted string without backslashes"
@@ -388,6 +397,7 @@ refresh=0
 max_wait=
 keep_days=
 dry_run=0
+forget_root=
 
 set_mode() {
   if [[ -n $mode && $mode != "$1" ]]; then
@@ -437,6 +447,17 @@ while (($#)); do
   --print-config) set_mode print-config ;;
   --print-defaults) set_mode print-defaults ;;
   --prune) set_mode prune ;;
+  --forget)
+    (($# >= 2)) && [[ -n $2 ]] || usage_error "--forget needs a project root"
+    set_mode forget
+    forget_root=$2
+    shift
+    ;;
+  --forget=*)
+    set_mode forget
+    forget_root=${1#--forget=}
+    [[ -n $forget_root ]] || usage_error "--forget needs a project root"
+    ;;
   --keep-days)
     (($# >= 2)) || usage_error "--keep-days needs a number of days"
     keep_days=$2
@@ -468,8 +489,11 @@ if [[ $mode == prune ]]; then
   keep_days=${keep_days:-$PRUNE_KEEP_DAYS}
   [[ $keep_days != *[!0123456789]* && ${#keep_days} -le 5 ]] ||
     usage_error "--keep-days needs a number of days: $keep_days"
+elif [[ $mode == forget ]]; then
+  ((! dir_given && ! refresh)) && [[ -z $max_wait && -z $keep_days ]] ||
+    usage_error "--forget cannot be combined with --dir, --refresh, --max-wait or --keep-days"
 elif [[ -n $keep_days ]] || ((dry_run)); then
-  usage_error "--keep-days and --dry-run need --prune"
+  usage_error "--keep-days needs --prune, and --dry-run --prune or --forget"
 fi
 
 if [[ $mode == print-config || $mode == print-defaults ]]; then
@@ -598,6 +622,54 @@ prune_all() {
 if [[ $mode == prune ]]; then
   [[ -n $cache_base ]] || die "cannot locate the cache: neither XDG_CACHE_HOME nor HOME is set"
   prune_all
+  exit 0
+fi
+
+# ---------------------------------------------------------------------------
+# --forget: a removed worktree's cache folder is otherwise only emptied by
+# age, one entry at a time, and the folder itself stays. Whatever removes a
+# worktree can call this for its root.
+
+# root_folder PATH : sets `folder` to the cache folder of the project root
+# PATH, an absolute path as the capture records it (symlinks resolved).
+root_folder() {
+  local sum
+  sum=$(printf '%s' "$1" | sha256sum) || die "sha256sum failed"
+  folder=$cache_base/$PROG/${sum:0:16}
+}
+
+# forget ROOT : deletes ROOT's cache folder, or with --dry-run prints its
+# files. ROOT may already be gone, as a removed worktree is: then it is taken
+# as written, so it must be the real path, without symlinks.
+forget() {
+  local path=$1 folder fd
+  [[ $path == /* ]] || path=$PWD/$path
+  if [[ -d $path ]]; then
+    path=$(cd -P -- "$path" && pwd) || die "cannot resolve $1"
+  else
+    while [[ $path == */ && $path != / ]]; do path=${path%/}; done
+  fi
+  root_folder "$path"
+  if [[ ! -d $folder || -L $folder ]]; then
+    printf '%s: nothing cached for %s\n' "$PROG" "$path" >&2
+    return 0
+  fi
+  if ((dry_run)); then
+    find "$folder" -mindepth 1 -maxdepth 1 -print | LC_ALL=C sort
+    return 0
+  fi
+  # A capture of this root holds the lock; its entry would land in a folder
+  # being deleted.
+  exec {fd}>>"$folder/.lock" || die "cannot open $folder/.lock"
+  flock -n "$fd" || die "a capture of $path is running; run --forget again once it finishes"
+  rm -rf -- "$folder"
+  exec {fd}>&-
+  printf '%s: forgot %s (%s)\n' "$PROG" "$path" "$folder" >&2
+}
+
+if [[ $mode == forget ]]; then
+  [[ -n $cache_base ]] || die "cannot locate the cache: neither XDG_CACHE_HOME nor HOME is set"
+  forget "$forget_root"
   exit 0
 fi
 
@@ -1197,6 +1269,249 @@ entry_bin=$(PATH=$base_path type -P "$entry_cmd") ||
   entry_bin=$(type -P "$entry_cmd") ||
   fail -m "$entry_cmd not found on PATH"
 env_bin=$(type -P env) || fail -m "env not found on PATH"
+
+# ---------------------------------------------------------------------------
+# Seed from a sibling worktree. The key holds no path, so another worktree
+# of this clone with an entry for the same key has captured the same
+# devshell. Its entry, with its root replaced by this one, stands in for a
+# capture (Nix's evaluation, its build and the shell hooks), and only the
+# hooks that act inside the root run here.
+#
+# The devshell says which hooks those are by exporting NDCE_WORKTREE_HOOK,
+# shell code run in the root with the devshell's environment (empty for
+# none). One that doesn't say is captured in full, since its hooks may act
+# inside the root.
+
+readonly WORKTREE_HOOK_VAR=NDCE_WORKTREE_HOOK
+# The per-worktree build variables, which `git-worktree-manager env` sets,
+# hold a hash of the worktree's path rather than the path, so a rewrite
+# can't fix them. Every run of it sets the variables in BUILDS_ALWAYS, and
+# BUILDS_LIST_VAR lists the languages' variables it set, BUILDS_LIST_SEP
+# between them; an entry that holds any of BUILDS_ALWAYS has them.
+readonly BUILDS_PROGRAM=git-worktree-manager
+readonly -a BUILDS_ALWAYS=(WORKTREE_MANAGER_BUILD_ROOT WORKTREE_MANAGER_BUILD_DIR WORKTREE_MANAGER_EXPORTED)
+readonly BUILDS_LIST_VAR=WORKTREE_MANAGER_EXPORTED BUILDS_LIST_SEP=:
+# The retired `worktrees` program names its per-worktree build variables in
+# WORKTREE_BUILDS_SET. Nothing here sets those, so an entry holding it is
+# never copied.
+readonly BUILDS_OLD_LIST_VAR=WORKTREE_BUILDS_SET
+
+# prefix_only TEXT OLD : whether every occurrence of OLD in TEXT is a whole
+# path or a path's leading directories: after a quote, `:`, `=`, a space or
+# a newline, and before `/`, a quote, `:`, a space or a newline. Any other
+# occurrence (a longer name, the root inside a word) could mean something a
+# rewrite gets wrong.
+prefix_only() {
+  local rest=$1 old=$2 before
+  local -r starts=$'\'":= \n' ends=$'/\'": \n'
+  while [[ $rest == *"$old"* ]]; do
+    before=${rest%%"$old"*}
+    rest=${rest#*"$old"}
+    [[ -n $before && $starts == *"${before: -1}"* ]] || return 1
+    [[ -z $rest || $ends == *"${rest:0:1}"* ]] || return 1
+  done
+}
+
+# find_seed : sets `seed_root`, `seed_folder` and `seed_text` from the first
+# other worktree of this clone whose entry for the current key is live,
+# names its root, declares its worktree hooks, holds its root only as a
+# path prefix and holds no BUILDS_OLD_LIST_VAR; returns 1 if none does.
+find_seed() {
+  local rel=${root#"$git_top"} line path folder text header
+  local -a lines=()
+  [[ $root != *[\'\\$'\n']* ]] || return 1
+  mapfile -d '' lines < <(git -C "$root" worktree list --porcelain -z 2>/dev/null)
+  for line in ${lines[@]+"${lines[@]}"}; do
+    [[ $line == 'worktree '?* ]] || continue
+    path=$(cd -P -- "${line#worktree }$rel" 2>/dev/null && pwd) || continue
+    [[ $path != "$root" && $path != *[\'\\$'\n']* ]] || continue
+    root_folder "$path"
+    [[ -s $folder/$key.sh ]] || continue
+    text=
+    IFS= read -r -d '' text <"$folder/$key.sh" || [[ -n $text ]] || continue
+    header=${text%%$'\n'*}
+    [[ $header == "# $PROG v3 root=$path key=$key" || $header == "# $PROG v3 root=$path key=$key store="* ]] || continue
+    live "$header" || continue
+    [[ $text == *$'\n'"export $WORKTREE_HOOK_VAR="* ]] || continue
+    [[ $text != *$'\n'"export $BUILDS_OLD_LIST_VAR="* ]] || continue
+    prefix_only "$text" "$path" || continue
+    seed_root=$path seed_folder=$folder seed_text=$text
+    return 0
+  done
+  return 1
+}
+
+# insert_before_tail TEXT CODE : sets `seeded` to TEXT with CODE inserted
+# before its last two lines, which record the root and the variables set.
+insert_before_tail() {
+  local head=${1%$'\n'"export __NDCE_ROOT="*}
+  seeded=$head$'\n'$2${1:${#head}+1}
+}
+
+# callers_var NAME : whether NAME is the caller's, passed through or
+# prepended to, and so never one git-worktree-manager owns.
+callers_var() {
+  matches_any "$1" ${passthrough[@]+"${passthrough[@]}"} ${prepend_vars[@]+"${prepend_vars[@]}"}
+}
+
+# builds_lines TEXT ALLOWED : whether every line of TEXT is an
+# `export NAME='VALUE'` of the shape `git-worktree-manager env --shell sh`
+# prints, each quote in VALUE written '\'', for a NAME in the
+# space-separated ALLOWED that is an identifier and not the caller's, and
+# no NAME is exported twice, since the shell keeps the last. In a seed's
+# run it prints only such lines, and no unset line, since the seed unsets
+# its list, unless Gradle is detected and GRADLE_OPTS lacks Gradle's
+# caching flag: then the seed is refused, and a capture sets it.
+builds_lines() {
+  local line name q="'"
+  local -r export_re="^export ([^=]*)=$q([^$q]|$q\\\\$q$q)*$q\$"
+  local -A seen=()
+  while IFS= read -r line; do
+    [[ $line =~ $export_re ]] || return 1
+    name=${BASH_REMATCH[1]}
+    [[ " $2 " == *" $name "* ]] && is_ident "$name" && ! callers_var "$name" &&
+      [[ -z ${seen[$name]+set} ]] || return 1
+    seen[$name]=1
+  done <<<"$1"
+}
+
+# same_names A B : whether the lists A and B, BUILDS_LIST_SEP between
+# names, hold the same names, in any order, and only identifiers.
+same_names() {
+  local name
+  local -a a=() b=()
+  local -A in_a=() in_b=()
+  IFS=$BUILDS_LIST_SEP read -r -a a <<<"$1" || true
+  IFS=$BUILDS_LIST_SEP read -r -a b <<<"$2" || true
+  for name in ${a[@]+"${a[@]}"} ${b[@]+"${b[@]}"}; do
+    [[ -z $name ]] || is_ident "$name" || return 1
+  done
+  for name in ${a[@]+"${a[@]}"}; do [[ -z $name ]] || in_a[$name]=1; done
+  for name in ${b[@]+"${b[@]}"}; do [[ -z $name ]] || in_b[$name]=1; done
+  ((${#in_a[@]} == ${#in_b[@]})) || return 1
+  for name in ${a[@]+"${a[@]}"}; do
+    [[ -z $name || -n ${in_b[$name]+set} ]] || return 1
+  done
+}
+
+# Whether $1 is on the PATH of a seed's run: the entry on standard input
+# loaded over the caller's environment.
+# shellcheck disable=SC2016 # single quotes intended: run by the bash below
+readonly BUILDS_PROBE='. /dev/stdin || exit
+command -v "$1"'
+
+# The seed's runs in the new root, each loading the seeded entry first:
+# one prints the per-worktree build variables with `git-worktree-manager
+# env`, if the sibling had them, and the other runs the worktree hooks.
+# shellcheck disable=SC2016 # single quotes intended: run by the bash below
+readonly BUILDS_SCRIPT='. "$1" || exit
+exec '"$BUILDS_PROGRAM"' env --shell sh'
+# shellcheck disable=SC2016 # single quotes intended: run by the bash below
+readonly SEED_SCRIPT='. "$1" || exit
+eval "${'"$WORKTREE_HOOK_VAR"'-}"'
+
+# seed_failed WHAT ERR : says that WHAT failed after seeding, with the end
+# of the file ERR, and returns 1.
+seed_failed() {
+  printf '%s: in %s, %s failed after seeding from %s; capturing in full:\n' \
+    "$PROG" "$root" "$1" "$seed_root" >&2
+  tail -n "$FAILED_TAIL_LINES" -- "$2" >&2 || true
+  return 1
+}
+
+# seed : writes and prints the current key's entry from a sibling's, and
+# exits 0; returns 1 for a full capture to follow when there is none to
+# use, when the sibling had per-worktree build variables but not their
+# list or git-worktree-manager isn't on the PATH to set this root's, when
+# git-worktree-manager env fails, prints a list other than the sibling's
+# or a line other than one export of each of its own or listed variables,
+# when the worktree hooks fail, or when a write fails.
+seed() {
+  local seed_root seed_folder seed_text seeded names builds='' re name env_path q="'"
+  local list builds_out
+  local -a set_names=()
+  find_seed || return 1
+  seeded=${seed_text//"$seed_root"/"$root"}
+
+  for name in "${BUILDS_ALWAYS[@]}"; do
+    [[ $seeded != *$'\n'"export $name="* ]] || builds=1
+  done
+  if [[ -n $builds ]]; then
+    # Refused before anything is written: the copy can't keep the
+    # sibling's values, git-worktree-manager env replaces a variable that
+    # is already set only when its list names it, and without the program
+    # this root would have none.
+    re=$'\n'"export $BUILDS_LIST_VAR=$q([^$q]*)$q"$'\n'
+    [[ $seeded =~ $re ]] || return 1
+    list=${BASH_REMATCH[1]}
+    env -i -- ${base_args[@]+"${base_args[@]}"} "$BASH" -c "$BUILDS_PROBE" ndce-probe \
+      "$BUILDS_PROGRAM" <<<"$seeded" >/dev/null 2>&1 {lock_fd}>&- || return 1
+    # Unset: the program's own names, and those of the list's that the
+    # entry itself exports and that aren't the caller's. Which variables
+    # the program sets depends on its version and the languages, so the
+    # entry's own export lines are what show a name is the program's.
+    names="${BUILDS_ALWAYS[*]}"
+    IFS=$BUILDS_LIST_SEP read -r -a set_names <<<"$list" || true
+    for name in ${set_names[@]+"${set_names[@]}"}; do
+      is_ident "$name" && [[ $seeded == *$'\n'"export $name="* ]] && ! callers_var "$name" &&
+        names+=" $name"
+    done
+    insert_before_tail "$seeded" "unset $names"$'\n'
+  fi
+
+  new_tmp seed
+  local entry_tmp=$tmp
+  new_tmp seed-err
+  local err_tmp=$tmp
+  printf '%s' "$seeded" >"$entry_tmp" || return 1
+  if [[ -n $builds ]]; then
+    new_tmp seed-builds
+    local builds_tmp=$tmp
+    env -i -- ${base_args[@]+"${base_args[@]}"} "$BASH" -c "$BUILDS_SCRIPT" ndce-seed \
+      "$entry_tmp" </dev/null >"$builds_tmp" 2>"$err_tmp" {lock_fd}>&- ||
+      seed_failed "$BUILDS_PROGRAM env" "$err_tmp" || return 1
+    builds_out=$(<"$builds_tmp") || return 1
+    # The same names, in any order: the entry's record of the variables to
+    # unload (__NDCE_VARS) and the languages detected are the sibling's.
+    if ! [[ $'\n'$builds_out$'\n' =~ $re ]] || ! same_names "${BASH_REMATCH[1]}" "$list"; then
+      printf "%s: in %s, %s env listed other variables than the sibling's entry; capturing in full\n" \
+        "$PROG" "$root" "$BUILDS_PROGRAM" >&2
+      return 1
+    fi
+    # Kept only as one export each of its own names and the listed ones,
+    # the sibling's.
+    if ! builds_lines "$builds_out" "${BUILDS_ALWAYS[*]} ${list//"$BUILDS_LIST_SEP"/ }"; then
+      printf "%s: in %s, %s env printed a line other than one export of each of its own or listed variables, not the caller's; capturing in full\n" \
+        "$PROG" "$root" "$BUILDS_PROGRAM" >&2
+      return 1
+    fi
+    insert_before_tail "$seeded" "$builds_out"$'\n'
+    printf '%s' "$seeded" >"$entry_tmp" || return 1
+  fi
+  env -i -- ${base_args[@]+"${base_args[@]}"} "$BASH" -c "$SEED_SCRIPT" ndce-seed \
+    "$entry_tmp" </dev/null >/dev/null 2>"$err_tmp" {lock_fd}>&- ||
+    seed_failed 'the worktree hooks' "$err_tmp" || return 1
+
+  # The sibling's GC root keeps the devshell only while the sibling's entry
+  # lasts; this root gets its own (best-effort: the store-path check on
+  # each load turns a collected devshell into a capture).
+  if env_path=$(readlink -f -- "$seed_folder/$key.profile" 2>/dev/null) && [[ -e $env_path ]]; then
+    env -i -- ${base_args[@]+"${base_args[@]}"} "${entry_bin%/*}/nix-store" \
+      --add-root "$cache_dir/$key.profile" --realise "$env_path" \
+      </dev/null >/dev/null 2>&1 {lock_fd}>&- || true
+  fi
+
+  mv -f -- "$entry_tmp" "$cache_file" || return 1
+  new_tmp last-good
+  ln -sf -- "$key.sh" "$tmp"
+  mv -f -- "$tmp" "$cache_dir/last-good"
+  printf '%s' "$seeded"
+  exit 0
+}
+
+if ((! refresh)) && ((in_git)); then
+  seed || true
+fi
 
 new_tmp baseline
 baseline_file=$tmp

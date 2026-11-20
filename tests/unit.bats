@@ -45,6 +45,10 @@ setup() {
   export GIT_COMMITTER_NAME=test GIT_COMMITTER_EMAIL=test@example.com
 
   unset TMPDIR TMP TEMP TEMPDIR
+  # The per-worktree build variables a seed test asserts on, which the
+  # shell running the tests may have from git-worktree-manager.
+  unset WORKTREE_MANAGER_BUILD_ROOT WORKTREE_MANAGER_BUILD_DIR WORKTREE_MANAGER_EXPORTED \
+    CARGO_BUILD_BUILD_DIR CARGO_TARGET_DIR
   # A load in the shell running the tests (this repo's own devshell, say)
   # would make the first load here take its environment back out.
   unset "${!__NDCE_@}"
@@ -157,6 +161,448 @@ nix_log_lines() {
   [ "$status" -eq 0 ]
   eval "$output"
   [ "$FIXTURE_HOOK_PWD" = "$wt" ]
+  # The devshell doesn't declare its worktree hooks: no seed.
+  [ "$(nix_log_lines)" -eq 1 ]
+  [ -e "$wt/marker" ]
+}
+
+# Captures fixture $1 in $proj, each further argument an empty file
+# committed in its root first, then adds a worktree of it as $wt on
+# branch wt-branch, cd'd into.
+captured_with_worktree() {
+  load_fixture "$1"
+  cd "$proj"
+  if [ "$#" -gt 1 ]; then
+    touch -- "${@:2}"
+    git add -- "${@:2}" && git commit -q -m markers
+  fi
+  run ndce
+  [ "$status" -eq 0 ]
+  [ "$(nix_log_lines)" -eq 1 ]
+  wt=$BATS_TEST_TMPDIR/worktree
+  git -C "$proj" worktree add -q "$wt" -b wt-branch
+  wt=$(cd -P "$wt" && pwd)
+  cd "$wt"
+}
+
+@test "a new worktree is seeded from a sibling's capture, root rewritten, worktree hook run" {
+  captured_with_worktree flake-worktree
+
+  run --separate-stderr ndce
+  [ "$status" -eq 0 ]
+  [ -z "$stderr" ]
+  [ "$(nix_log_lines)" -eq 1 ]
+  [[ $output == "# nix-devshell-cached-exports v3 root=$wt key="* ]]
+  [[ $output != *"$proj"* ]]
+  eval "$output"
+  [ "$FIXTURE_ROOT" = "$wt" ]
+  [ "$FIXTURE_DIRS" = "$wt/sub:$wt" ]
+  [ "$__NDCE_ROOT" = "$wt" ]
+  # The declared hook ran in the worktree; the rest of the startup didn't.
+  [ "$(cat "$wt/marker")" = hook ]
+  [ ! -e "$wt/startup" ]
+
+  # The seeded entry is this root's own: the next call is a hit.
+  rm "$wt/marker"
+  run ndce
+  [ "$status" -eq 0 ]
+  [ ! -e "$wt/marker" ]
+  [ "$(nix_log_lines)" -eq 1 ]
+  [ -L "$(dirname "$(ndce --print-cache-path)")/last-good" ]
+}
+
+@test "a seeded worktree gets its own GC root for the sibling's devshell" {
+  export NDCE_FLAKE_SOURCE=tree
+  captured_with_worktree flake-worktree
+  run ndce
+  [ "$status" -eq 0 ]
+  [ "$(nix_log_lines)" -eq 1 ]
+  key=$(ndce --print-key)
+  profile=$(dirname "$(ndce --print-cache-path)")/$key.profile
+  [ -L "$profile" ]
+  [ "$(readlink -f "$profile")" = "$proj" ]
+}
+
+# Drops from PATH each directory holding a git-worktree-manager, so a test
+# sees none, whatever the machine running it has installed.
+path_without_git_worktree_manager() {
+  local dir kept=
+  local -a dirs=()
+  IFS=: read -r -a dirs <<<"$PATH"
+  for dir in "${dirs[@]}"; do
+    [ -x "$dir/git-worktree-manager" ] || kept+=${kept:+:}$dir
+  done
+  export PATH=$kept
+}
+
+@test "no seed without git-worktree-manager on PATH when the sibling had per-worktree build variables" {
+  path_without_git_worktree_manager
+  captured_with_worktree flake-worktree BUILD_VARIABLES
+  wt_dir=$HOME/builds/wt/worktree-$(printf '%s' "$wt" | sha256sum | cut -c1-8)
+
+  run ndce
+  [ "$status" -eq 0 ]
+  [ "$(nix_log_lines)" -eq 2 ]
+  [ -e "$wt/startup" ]
+  eval "$output"
+  [ "$WORKTREE_MANAGER_BUILD_DIR" = "$wt_dir" ]
+  [ "$CARGO_TARGET_DIR" = "$wt_dir/target" ]
+}
+
+@test "a sibling without per-worktree build variables is seeded without git-worktree-manager on PATH" {
+  path_without_git_worktree_manager
+  captured_with_worktree flake-worktree
+
+  run ndce
+  [ "$status" -eq 0 ]
+  [ "$(nix_log_lines)" -eq 1 ]
+  [ ! -e "$wt/startup" ]
+  eval "$output"
+  [ "$FIXTURE_ROOT" = "$wt" ]
+  [ -z "${WORKTREE_MANAGER_BUILD_DIR+set}" ]
+}
+
+# Puts first on PATH an unrelated program named worktrees that logs each
+# run to $HOME/worktrees.log.
+stub_worktrees() {
+  mkdir -p "$BATS_TEST_TMPDIR/bin"
+  cat >"$BATS_TEST_TMPDIR/bin/worktrees" <<'EOF'
+#!/usr/bin/env bash
+echo "worktrees $*" >>"$HOME/worktrees.log"
+EOF
+  chmod +x "$BATS_TEST_TMPDIR/bin/worktrees"
+  export PATH=$BATS_TEST_TMPDIR/bin:$PATH
+}
+
+# Puts first on PATH a git-worktree-manager whose `env --shell sh` logs its
+# run to $HOME/git-worktree-manager.log and prints what the real one prints
+# for a Rust project in an environment without WORKTREE_MANAGER_EXPORTED,
+# as in a seed's run: no unset lines, the build root and the worktree's
+# folder, each language variable that isn't already set (one that is
+# counts as a person's, since no list names it), and the list of those.
+# With a $HOME/git-worktree-manager.fail file, it fails instead; a
+# $HOME/git-worktree-manager.target file holds CARGO_TARGET_DIR's value as
+# it prints it, quoted, a $HOME/git-worktree-manager.list file the list
+# it prints in place of its own, and a $HOME/git-worktree-manager.extra
+# file lines it prints after it.
+stub_git_worktree_manager() {
+  mkdir -p "$BATS_TEST_TMPDIR/bin"
+  cat >"$BATS_TEST_TMPDIR/bin/git-worktree-manager" <<'EOF'
+#!/usr/bin/env bash
+[ "$*" = "env --shell sh" ] || exit 64
+[ -z "${WORKTREE_MANAGER_EXPORTED+set}" ] || exit 65
+echo "git-worktree-manager env in $PWD" >>"$HOME/git-worktree-manager.log"
+if [ -e "$HOME/git-worktree-manager.fail" ]; then
+  echo "git-worktree-manager stub: failing" >&2
+  exit 1
+fi
+root=$HOME/builds
+dir=$root/wt/${PWD##*/}-$(printf '%s' "$PWD" | sha256sum | cut -c1-8)
+printf "export WORKTREE_MANAGER_BUILD_ROOT='%s'\n" "$root"
+printf "export WORKTREE_MANAGER_BUILD_DIR='%s'\n" "$dir"
+listed=
+if [ -z "${CARGO_BUILD_BUILD_DIR+set}" ]; then
+  printf "export CARGO_BUILD_BUILD_DIR='%s'\n" "$root/shared/cargo-build"
+  listed=CARGO_BUILD_BUILD_DIR
+fi
+if [ -z "${CARGO_TARGET_DIR+set}" ]; then
+  if [ -e "$HOME/git-worktree-manager.target" ]; then
+    printf "export CARGO_TARGET_DIR=%s\n" "$(cat "$HOME/git-worktree-manager.target")"
+  else
+    printf "export CARGO_TARGET_DIR='%s'\n" "$dir/target"
+  fi
+  listed=${listed:+$listed:}CARGO_TARGET_DIR
+fi
+if [ -e "$HOME/git-worktree-manager.list" ]; then
+  listed=$(cat "$HOME/git-worktree-manager.list")
+fi
+printf "export WORKTREE_MANAGER_EXPORTED='%s'\n" "$listed"
+if [ -e "$HOME/git-worktree-manager.extra" ]; then
+  cat "$HOME/git-worktree-manager.extra"
+fi
+EOF
+  chmod +x "$BATS_TEST_TMPDIR/bin/git-worktree-manager"
+  export PATH=$BATS_TEST_TMPDIR/bin:$PATH
+}
+
+@test "a refused seed never runs an unrelated program named worktrees" {
+  path_without_git_worktree_manager
+  stub_worktrees
+  captured_with_worktree flake-worktree BUILD_VARIABLES
+
+  run ndce
+  [ "$status" -eq 0 ]
+  [ "$(nix_log_lines)" -eq 2 ]
+  [ ! -e "$HOME/worktrees.log" ]
+}
+
+@test "a seed takes the per-worktree build variables from git-worktree-manager env" {
+  stub_worktrees
+  stub_git_worktree_manager
+  captured_with_worktree flake-worktree BUILD_VARIABLES
+  main_hash=$(printf '%s' "$proj" | sha256sum | cut -c1-8)
+  wt_dir=$HOME/builds/wt/worktree-$(printf '%s' "$wt" | sha256sum | cut -c1-8)
+
+  run --separate-stderr ndce
+  [ "$status" -eq 0 ]
+  [ -z "$stderr" ]
+  [ "$(nix_log_lines)" -eq 1 ]
+  [ ! -e "$wt/startup" ]
+  [ "$(cat "$HOME/git-worktree-manager.log")" = "git-worktree-manager env in $wt" ]
+  [ ! -e "$HOME/worktrees.log" ]
+  eval "$output"
+  [ "$WORKTREE_MANAGER_BUILD_DIR" = "$wt_dir" ]
+  [ "$CARGO_TARGET_DIR" = "$wt_dir/target" ]
+  [[ $CARGO_TARGET_DIR != *"$main_hash"* ]]
+  [ "$WORKTREE_MANAGER_EXPORTED" = CARGO_BUILD_BUILD_DIR:CARGO_TARGET_DIR ]
+}
+
+@test "no seed when the sibling had per-worktree build variables but not their list" {
+  stub_git_worktree_manager
+  captured_with_worktree flake-worktree BUILD_VARIABLES NO_EXPORTED_LIST
+
+  run ndce
+  [ "$status" -eq 0 ]
+  [ "$(nix_log_lines)" -eq 2 ]
+  [ -e "$wt/startup" ]
+  [ ! -e "$HOME/git-worktree-manager.log" ]
+}
+
+@test "a failing git-worktree-manager env after a seed falls back to a full capture" {
+  stub_git_worktree_manager
+  captured_with_worktree flake-worktree BUILD_VARIABLES
+  touch "$HOME/git-worktree-manager.fail"
+
+  run --separate-stderr ndce
+  [ "$status" -eq 0 ]
+  [ "$(nix_log_lines)" -eq 2 ]
+  [[ $stderr == *"git-worktree-manager env failed"* ]]
+  [[ $stderr == *"git-worktree-manager stub: failing"* ]]
+}
+
+@test "no seed from an entry holding the retired worktrees program's WORKTREE_BUILDS_SET" {
+  stub_git_worktree_manager
+  captured_with_worktree flake-worktree OLD_BUILDS_SET
+
+  run ndce
+  [ "$status" -eq 0 ]
+  [ "$(nix_log_lines)" -eq 2 ]
+  [ -e "$wt/startup" ]
+  [ ! -e "$HOME/git-worktree-manager.log" ]
+}
+
+@test "a git-worktree-manager env list other than the sibling's gives a full capture, no seeded entry" {
+  stub_git_worktree_manager
+  captured_with_worktree flake-worktree BUILD_VARIABLES
+  echo CARGO_TARGET_DIR:TF_DATA_DIR >"$HOME/git-worktree-manager.list"
+
+  run --separate-stderr ndce
+  [ "$status" -eq 0 ]
+  [ "$(nix_log_lines)" -eq 2 ]
+  [ -e "$wt/startup" ]
+  [ "$(cat "$HOME/git-worktree-manager.log")" = "git-worktree-manager env in $wt" ]
+  [[ $stderr == *"git-worktree-manager env listed other variables than the sibling's entry"* ]]
+  cache_file=$(ndce --print-cache-path)
+  # The entry is the capture's: a seed's alone holds the unset line.
+  [ "$(grep -c TF_DATA_DIR "$cache_file")" -eq 0 ]
+  [ "$(grep -c '^unset WORKTREE_MANAGER_BUILD_ROOT ' "$cache_file")" -eq 0 ]
+  eval "$output"
+  [ "$WORKTREE_MANAGER_EXPORTED" = CARGO_BUILD_BUILD_DIR:CARGO_TARGET_DIR ]
+}
+
+@test "a seed never unsets a variable of the caller's, though the sibling's list names it" {
+  stub_git_worktree_manager
+  captured_with_worktree flake-worktree BUILD_VARIABLES LIST_NAMES_TZ
+  echo CARGO_BUILD_BUILD_DIR:CARGO_TARGET_DIR:TZ >"$HOME/git-worktree-manager.list"
+
+  run --separate-stderr ndce
+  [ "$status" -eq 0 ]
+  [ -z "$stderr" ]
+  [ "$(nix_log_lines)" -eq 1 ]
+  [[ $output == *$'\n'"export TZ="* ]]
+  eval "$output"
+  [ "$TZ" = NDCE0 ]
+}
+
+@test "a git-worktree-manager env export of a variable of the caller's refuses the seed" {
+  stub_git_worktree_manager
+  captured_with_worktree flake-worktree BUILD_VARIABLES LIST_NAMES_TZ
+  echo CARGO_BUILD_BUILD_DIR:CARGO_TARGET_DIR:TZ >"$HOME/git-worktree-manager.list"
+  echo "export TZ='OTHER0'" >"$HOME/git-worktree-manager.extra"
+
+  run --separate-stderr ndce
+  [ "$status" -eq 0 ]
+  [ "$(nix_log_lines)" -eq 2 ]
+  [[ $stderr == *"git-worktree-manager env printed a line other than one export of each of its own or listed variables"* ]]
+  [ "$(grep -c OTHER0 "$(ndce --print-cache-path)")" -eq 0 ]
+}
+
+@test "a git-worktree-manager env export of a variable neither fixed nor listed refuses the seed" {
+  stub_git_worktree_manager
+  captured_with_worktree flake-worktree BUILD_VARIABLES
+  echo "export BASH_ENV='/tmp/injected'" >"$HOME/git-worktree-manager.extra"
+
+  run --separate-stderr ndce
+  [ "$status" -eq 0 ]
+  [ "$(nix_log_lines)" -eq 2 ]
+  [[ $stderr == *"git-worktree-manager env printed a line other than one export of each of its own or listed variables"* ]]
+  [ "$(grep -c BASH_ENV "$(ndce --print-cache-path)")" -eq 0 ]
+}
+
+@test "a seed never unsets PATH, though the sibling's list names it" {
+  stub_git_worktree_manager
+  captured_with_worktree flake-worktree BUILD_VARIABLES LIST_NAMES_PATH
+  echo CARGO_BUILD_BUILD_DIR:CARGO_TARGET_DIR:PATH >"$HOME/git-worktree-manager.list"
+
+  run --separate-stderr ndce
+  [ "$status" -eq 0 ]
+  [ -z "$stderr" ]
+  [ "$(nix_log_lines)" -eq 1 ]
+  unset_line=$(grep '^unset WORKTREE_MANAGER_BUILD_ROOT ' <<<"$output")
+  [[ " $unset_line " == *" CARGO_TARGET_DIR "* ]]
+  [[ " $unset_line " != *" PATH "* ]]
+}
+
+@test "a git-worktree-manager env line that is neither an export nor an unset refuses the seed" {
+  stub_git_worktree_manager
+  captured_with_worktree flake-worktree BUILD_VARIABLES
+  echo 'touch "$HOME/injected"' >"$HOME/git-worktree-manager.extra"
+
+  run --separate-stderr ndce
+  [ "$status" -eq 0 ]
+  [ "$(nix_log_lines)" -eq 2 ]
+  [ -e "$wt/startup" ]
+  [[ $stderr == *"git-worktree-manager env printed a line other than one export of each of its own or listed variables"* ]]
+  [ ! -e "$HOME/injected" ]
+  [ "$(grep -c injected "$(ndce --print-cache-path)")" -eq 0 ]
+}
+
+@test "any git-worktree-manager env unset line refuses the seed" {
+  stub_git_worktree_manager
+  captured_with_worktree flake-worktree BUILD_VARIABLES
+  echo "unset CARGO_TARGET_DIR" >"$HOME/git-worktree-manager.extra"
+
+  run --separate-stderr ndce
+  [ "$status" -eq 0 ]
+  [ "$(nix_log_lines)" -eq 2 ]
+  [[ $stderr == *"git-worktree-manager env printed a line other than one export of each of its own or listed variables"* ]]
+  [ "$(grep -c '^unset CARGO_TARGET_DIR$' "$(ndce --print-cache-path)")" -eq 0 ]
+}
+
+@test "a git-worktree-manager env export of one name twice refuses the seed" {
+  stub_git_worktree_manager
+  captured_with_worktree flake-worktree BUILD_VARIABLES
+  echo "export WORKTREE_MANAGER_EXPORTED='CARGO_BUILD_BUILD_DIR:CARGO_TARGET_DIR:TF_DATA_DIR'" \
+    >"$HOME/git-worktree-manager.extra"
+
+  run --separate-stderr ndce
+  [ "$status" -eq 0 ]
+  [ "$(nix_log_lines)" -eq 2 ]
+  [[ $stderr == *"git-worktree-manager env printed a line other than one export of each of its own or listed variables"* ]]
+  [ "$(grep -c TF_DATA_DIR "$(ndce --print-cache-path)")" -eq 0 ]
+}
+
+@test "a git-worktree-manager env value with a quote, escaped as it prints it, is kept" {
+  stub_git_worktree_manager
+  captured_with_worktree flake-worktree BUILD_VARIABLES
+  cat >"$HOME/git-worktree-manager.target" <<'EOF'
+'it'\''s'
+EOF
+
+  run ndce
+  [ "$status" -eq 0 ]
+  [ "$(nix_log_lines)" -eq 1 ]
+  eval "$output"
+  [ "$CARGO_TARGET_DIR" = "it's" ]
+}
+
+@test "no seed when the sibling's capture holds its root other than as a path prefix" {
+  load_fixture flake-worktree
+  touch "$proj/ODD_ROOT"
+  cd "$proj"
+  run ndce
+  [ "$status" -eq 0 ]
+  [[ $output == *"$proj-odd"* ]]
+  wt=$BATS_TEST_TMPDIR/worktree
+  git -C "$proj" worktree add -q "$wt" -b wt-branch
+  wt=$(cd -P "$wt" && pwd)
+  cd "$wt"
+
+  run ndce
+  [ "$status" -eq 0 ]
+  [ "$(nix_log_lines)" -eq 2 ]
+  [ -e "$wt/startup" ]
+  eval "$output"
+  [ "$FIXTURE_ROOT" = "$wt" ]
+  [ -z "${FIXTURE_ODD+set}" ]
+}
+
+@test "no seed for a worktree whose flake.nix differs" {
+  captured_with_worktree flake-worktree
+  echo "# changed in the worktree" >>"$wt/flake.nix"
+  git -C "$wt" add -- flake.nix
+  git -C "$wt" commit -q -m "change flake.nix"
+
+  run ndce
+  [ "$status" -eq 0 ]
+  [ "$(nix_log_lines)" -eq 2 ]
+  [ -e "$wt/startup" ]
+}
+
+@test "a failing worktree hook after a seed falls back to a full capture" {
+  captured_with_worktree flake-worktree
+  # The hook appends to marker; a directory there makes it fail.
+  mkdir "$wt/marker"
+
+  run --separate-stderr ndce
+  [ "$(nix_log_lines)" -eq 2 ]
+  [[ $stderr == *"worktree hooks failed"* ]]
+}
+
+@test "--refresh in a new worktree captures in full rather than seeding" {
+  captured_with_worktree flake-worktree
+  run ndce --refresh
+  [ "$status" -eq 0 ]
+  [ "$(nix_log_lines)" -eq 2 ]
+  [ -e "$wt/startup" ]
+}
+
+@test "--forget deletes one root's cache folder, and only that one" {
+  captured_with_worktree flake-worktree
+  run ndce
+  [ "$status" -eq 0 ]
+  wt_folder=$(dirname "$(ndce --print-cache-path)")
+  main_folder=$(dirname "$(ndce --dir "$proj" --print-cache-path)")
+  [ -d "$wt_folder" ] && [ -d "$main_folder" ]
+
+  run ndce --forget "$wt" --dry-run
+  [ "$status" -eq 0 ]
+  [[ $output == *"$wt_folder/last-good"* ]]
+  [ -d "$wt_folder" ]
+
+  cd "$BATS_TEST_TMPDIR"
+  git -C "$proj" worktree remove --force "$wt"
+  # Gone from disk, the root is taken as written.
+  run --separate-stderr ndce --forget "$wt/"
+  [ "$status" -eq 0 ]
+  [[ $stderr == *"forgot $wt "* ]]
+  [ ! -e "$wt_folder" ]
+  [ -d "$main_folder" ]
+
+  run --separate-stderr ndce --forget "$wt"
+  [ "$status" -eq 0 ]
+  [[ $stderr == *"nothing cached for $wt"* ]]
+}
+
+@test "--forget usage errors" {
+  run ndce --forget
+  [ "$status" -eq 2 ]
+  run ndce --forget /x --refresh
+  [ "$status" -eq 2 ]
+  run ndce --forget /x --keep-days 3
+  [ "$status" -eq 2 ]
+  run ndce --forget /x --prune
+  [ "$status" -eq 2 ]
 }
 
 @test "TMPDIR TMP TEMP TEMPDIR survive eval unchanged" {
@@ -1224,6 +1670,13 @@ write_user_config() {
   NDCE_FLAKE_SOURCE=minimal NDCE_SECRET_VARS='A  B' run ndce --print-config
   [[ $output == *'flake-source = "minimal"  # environment: NDCE_FLAKE_SOURCE'* ]]
   [[ $output == *'secret-vars = ["A", "B"]  # environment: NDCE_SECRET_VARS'* ]]
+}
+
+@test "config: a list's comma may start the next line" {
+  write_user_config 'exclude = ["A"' '  , "B"' '  ,]'
+  run --separate-stderr ndce --print-config
+  [ "$status" -eq 0 ]
+  [[ $output == *"exclude = [\"A\", \"B\"]  # user: $user_config"* ]]
 }
 
 @test "config: an unknown key, a wrong kind or value, or a key set twice is refused" {

@@ -11,23 +11,10 @@
       inputs.nixpkgs.follows = "nixpkgs";
     };
 
-    # Skill sources, the same repos `github:nhooey/skillspkgs` aggregates.
-    # They follow `nixpkgs` but not `agent-skill-flake`, so each keeps its own
-    # compatible builder.
-    coding-agent-skills = {
-      url = "github:nhooey/coding-agent-skills";
-      inputs.nixpkgs.follows = "nixpkgs";
-    };
-    git-skills = {
-      url = "github:nhooey/git-skills";
-      inputs.nixpkgs.follows = "nixpkgs";
-    };
-    nix-skills = {
-      url = "github:nhooey/nix-skills";
-      inputs.nixpkgs.follows = "nixpkgs";
-    };
-    shell-skills = {
-      url = "github:nhooey/shell-skills";
+    # skillspkgs' per-family skill combinations. It follows `nixpkgs` but not
+    # `agent-skill-flake`, so its sources keep their own compatible builder.
+    skillspkgs-combinations = {
+      url = "github:nhooey/skillspkgs?dir=sources/combinations";
       inputs.nixpkgs.follows = "nixpkgs";
     };
   };
@@ -43,27 +30,9 @@
       systems = import inputs.systems;
       name = "nix-devshell-cached-exports-skills";
       sources = [
-        # Commits, branches and pull requests, and the GitHub policies.
-        { source = inputs.git-skills; }
-        # Writing this flake, the package and the skills sub-flake.
-        {
-          source = inputs.nix-skills;
-          skills = [
-            "nix-flakes"
-          ];
-        }
-        # Safe shell commands: named deletes, PIDs, no machine-wide changes.
-        { source = inputs.shell-skills; }
-        # Running as a headless session in a checkout, keeping the
-        # scratchpad tidy, and the plans graph.
-        {
-          source = inputs.coding-agent-skills;
-          skills = [
-            "coding-agent-headless-in-checkout"
-            "coding-agent-plans-as-graph"
-            "coding-agent-scratchpad-scripts"
-          ];
-        }
+        # The Nix tooling family's combination, and nothing beyond it: the
+        # shell skills this Shell repository needs are already in it.
+        { source = inputs.skillspkgs-combinations.combinations.nix-tooling; }
       ];
     };
 }
